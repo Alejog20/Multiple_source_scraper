@@ -259,7 +259,7 @@ You should see output indicating all tests passed. Failed tests indicate website
 
 ---
 
-## 8. Version 7.0 Changelog
+## 8. Version 0.1.0 Changelog
 
 ### Major Improvements
 -  **Fixed MercadoLibre Title Extraction** - Now correctly extracts from img[title] attributes

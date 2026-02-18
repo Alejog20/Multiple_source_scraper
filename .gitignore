@@ -8,14 +8,20 @@
 *.db
 *.sqlite
 *.sqlite3
+*.db-journal
+scraper.log
 
 .venv/
 venv/
 env/
 .env
+.env.local
+.env.*
 
 __pycache__/
 *.pyc
+*.py[cod]
+*.$py.class
 *.pyo
 *.pyd
 .Python
@@ -52,3 +58,6 @@ secrets.json
 .tox/
 htmlcov/
 .pytest_cache/
+
+.DS_Store
+Thumbs.db

@@ -1,7 +1,7 @@
 [project]
-name = "amaz-scraper"
+name = "multiple-scraper"
 version = "0.1.0"
-description = "Add your description here"
+description = "Scraper academic project"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,4 +16,6 @@ dependencies = [
     "selectolax>=0.3.34",
     "setuptools>=80.9.0",
     "playwright>=1.55.0",
+    "asyncio>=4.0.0",
+    "python-dotenv>=1.2.1",
 ]
