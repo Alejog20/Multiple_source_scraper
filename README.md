@@ -1,4 +1,4 @@
-# Multi-Platform E-Commerce Scraper - Version 7.0 (Production Edition)
+# Multi-Platform E-Commerce Scraper - Version 0.1.0
 
 ## 1. Project Status & Overview
 
@@ -6,7 +6,7 @@ This project represents the **definitive enterprise-grade** version of the multi
 
 The core philosophy has evolved to **Undetectable, Validated, and Production-Ready**. The scraper now defeats modern bot-detection systems, validates all extracted data, and employs sophisticated multi-layered strategies for maximum success rates.
 
-### **What's New in Version 7.0**
+### **What's New**
 
 **Revolutionary Anti-Detection:**
 - **Playwright-Stealth Integration:** Advanced browser fingerprint masking
@@ -259,7 +259,7 @@ You should see output indicating all tests passed. Failed tests indicate website
 
 ---
 
-## 8. Version 7.0 Changelog
+## 8. Version 0.1.0 Changelog
 
 ### Major Improvements
 -  **Fixed MercadoLibre Title Extraction** - Now correctly extracts from img[title] attributes
