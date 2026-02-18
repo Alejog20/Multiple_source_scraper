@@ -1,16 +1,16 @@
-# Multi-Platform E-Commerce Scraper - Version 0.1.0
+# Multi-Platform E-Commerce Scraper - Version 2.0
 
 ## 1. Project Status & Overview
 
-This project represents the **definitive enterprise-grade** version of the multi-platform scraper, completely refactored with cutting-edge anti-detection technologies and modern Python architecture. This version addresses all previous failures through advanced stealth mechanisms, comprehensive data validation, and a robust offline testing framework.
+This project represents an academic project for multi-platform scraper, completely using modern Python architecture. This version addresses failures through comprehensive data validation, and a robust offline testing framework.
 
-The core philosophy has evolved to **Undetectable, Validated, and Production-Ready**. The scraper now defeats modern bot-detection systems, validates all extracted data, and employs sophisticated multi-layered strategies for maximum success rates.
+The scraper validates all extracted data, and employs sophisticated multi-layered strategies for maximum success rates.
 
-### **What's New**
+### **What's New in Version 2.0**
 
 **Revolutionary Anti-Detection:**
-- **Playwright-Stealth Integration:** Advanced browser fingerprint masking
-- **Enhanced Browser Headers:** Modern sec-ch-ua and realistic fingerprinting
+- **Playwright-Stealth Integration:** Browser fingerprint masking
+- **Enhanced Browser Headers:** Sec-ch-ua realistic fingerprinting
 - **Intelligent Retry Logic:** Exponential backoff with smart error classification
 - **Dynamic User-Agent Pools:** Latest browser versions with mobile/desktop variants
 
@@ -20,18 +20,18 @@ The core philosophy has evolved to **Undetectable, Validated, and Production-Rea
 - **Advanced Price Parsing:** Handles Colombian peso format and complex price structures
 - **URL & ID Extraction:** Improved pattern matching for product identification
 
-**Production-Grade Architecture:**
-- **Modern Python Typing:** Complete type annotations throughout codebase
+**Architecture:**
+- **Modern Python Typing:** Type annotations throughout codebase
 - **Comprehensive Data Validation:** Field-level validation with type checking
 - **Modular Design:** Clear separation of concerns with maintainable code structure
 
 **Current Functionality:**
--   **Multi-Platform:** Scrapes product data from Amazon.com and MercadoLibre with advanced parsing
--   **Stealth Evasion:** Integrates `playwright-stealth` with custom anti-detection scripts
--   **Resilient:** 5-layer strategy funnel with intelligent retry mechanisms and exponential backoff
+-   **Multi-Platform:** Scrapes product data with advanced parsing
+-   **Stealth Evasion:** Integrates `playwright-stealth`
+-   **Resilient:** 5-layer strategy funnel with intelligent retry mechanisms
 -   **Self-Validating:** Comprehensive `unittest` framework with offline HTML testing
 -   **Asynchronous:** High-performance async architecture with `httpx` and `playwright`
--   **Production-Ready:** Clean, typed codebase following modern Python best practices
+-   **Production-Ready:** Clean, typed codebase following Python best practices
 -   **Comprehensive Logging:** Detailed execution logs with intelligent error reporting
 
 ---
@@ -157,7 +157,7 @@ This diagram illustrates the project's complete operational flow from start to f
 
 ### Step 1: Clone the Project
 ```bash
-git clone <repository-url>
+git clone <github.com/Alejog20/Multiple_source_scraper>
 cd <repository-directory>
 ```
 
