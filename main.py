@@ -4,6 +4,9 @@ from datetime import datetime
 import logging
 from typing import List, Dict, Any
 
+from sqlalchemy import select
+from database import init_db, session_scope, TrackedJob, ScrapeHistory, ScrapedProduct
+
 from rich.prompt import Prompt, IntPrompt
 from rich.table import Table
 
@@ -21,8 +24,7 @@ from debug_utils import (
 
 try:
     check_dependencies()
-    from amazon_scraper import AmazonScraper
-    from mercadolibre_scraper import MercadoLibreScraper
+    from core_engine import execute_scrape
 except ImportError as e:
     console.print(
         Panel(
@@ -42,20 +44,38 @@ logger = logging.getLogger(__name__)
 
 def get_user_input() -> Dict[str, Any]:
     """Gets all necessary input from the user."""
-    platforms = {"1": "Amazon", "2": "MercadoLibre", "3": "Both"}
+    choice_to_platforms = {
+        "1": ["amazon"],
+        "2": ["mercadolibre"],
+        "3": ["amazon", "mercadolibre"],
+    }
     console.print("[bold]Select a platform to scrape:[/bold]")
-    for key, value in platforms.items():
-        console.print(f"  [cyan]{key}[/cyan]. {value}")
+    console.print("  [cyan]1[/cyan]. Amazon")
+    console.print("  [cyan]2[/cyan]. MercadoLibre")
+    console.print("  [cyan]3[/cyan]. Both")
 
     choice = Prompt.ask(
         "[bold]Enter your choice[/bold]", choices=["1", "2", "3"], default="3"
     )
     query = Prompt.ask("[bold yellow]What product are you looking for?[/bold yellow]")
     pages = IntPrompt.ask(
-        "[bold yellow]How many pages per platform?[/bold yellow]", default=1
+        "[bold yellow]How many pages per platform? (0 = all available)[/bold yellow]", default=1
     )
+    pages = 0 if pages == 0 else min(pages, 10)
 
-    return {"choice": choice, "query": query, "pages": min(pages, 10)}
+    include_ads_str = Prompt.ask(
+        "[bold yellow]Include sponsored/advertised products?[/bold yellow]",
+        choices=["y", "n"],
+        default="y",
+    )
+    include_ads = include_ads_str == "y"
+
+    return {
+        "platforms": choice_to_platforms[choice],
+        "query": query,
+        "pages": pages,
+        "include_ads": include_ads,
+    }
 
 
 def display_results_table(products: List[Dict[str, Any]]) -> None:
@@ -139,41 +159,223 @@ def smart_deduplicate(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(unique_products.values())
 
 
+async def export_history() -> None:
+    """Query all tracked jobs from the local DB and export chosen job's history to Excel."""
+    await init_db()  # ensure scraped_products table exists before querying
+    async with session_scope() as session:
+        result = await session.execute(
+            select(TrackedJob).order_by(TrackedJob.created_at.desc())
+        )
+        jobs = result.scalars().all()
+
+    if not jobs:
+        console.print("\n[bold red]No tracked jobs found in the database.[/bold red]")
+        console.print("[yellow]Run the Telegram bot and create a /track job first.[/yellow]")
+        return
+
+    console.print("\n[bold]Available jobs:[/bold]")
+    for job in jobs:
+        status = "[green]active[/green]" if job.is_active else "[dim]ended[/dim]"
+        platforms = ", ".join(p.capitalize() for p in job.get_platforms())
+        console.print(
+            f"  [cyan]{job.id}[/cyan]. {job.query[:40]} | {platforms} | {status}"
+        )
+
+    job_ids = [str(j.id) for j in jobs]
+    chosen_id = int(Prompt.ask(
+        "[bold yellow]Enter Job ID to export[/bold yellow]", choices=job_ids
+    ))
+
+    async with session_scope() as session:
+        j_result = await session.execute(
+            select(TrackedJob).where(TrackedJob.id == chosen_id)
+        )
+        job = j_result.scalar_one()
+
+        p_result = await session.execute(
+            select(ScrapedProduct)
+            .join(ScrapeHistory, ScrapedProduct.history_id == ScrapeHistory.id)
+            .where(ScrapeHistory.job_id == chosen_id)
+            .order_by(ScrapeHistory.timestamp.asc(), ScrapedProduct.id.asc())
+        )
+        products = p_result.scalars().all()
+
+    if not products:
+        console.print(f"\n[bold red]Job #{chosen_id} has no recorded products yet.[/bold red]")
+        return
+
+    records = [
+        {
+            "id": p.product_id,
+            "title": p.title,
+            "price": p.price,
+            "url": p.url,
+            "source": p.source,
+            "currency": p.currency,
+            "rating": p.rating,
+            "review_count": p.review_count,
+        }
+        for p in products
+    ]
+    df = pd.DataFrame(records)
+
+    filename = (
+        f"history_job{chosen_id}_{job.query[:20].replace(' ', '_')}"
+        f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    )
+
+    try:
+        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+            meta = pd.DataFrame([{
+                "Job ID": job.id,
+                "Query": job.query,
+                "Platforms": ", ".join(job.get_platforms()),
+                "Schedule": job.schedule_type,
+                "Pages per run": job.pages_per_run,
+                "Include ads": job.include_ads,
+                "Active": job.is_active,
+                "Expires": job.expiration_date.strftime("%Y-%m-%d"),
+            }])
+            meta.to_excel(writer, index=False, sheet_name="Job Info")
+            df.to_excel(writer, index=False, sheet_name="Products")
+            ws = writer.sheets["Products"]
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = max(12, max_len + 2)
+
+        console.print(
+            f"\n[bold green]Exported {len(products)} product(s) to "
+            f"[underline]{filename}[/underline][/bold green]"
+        )
+    except Exception as e:
+        console.print(f"[bold red]Export failed: {e}[/bold red]")
+
+
+async def trigger_job_scrape() -> None:
+    """Manually run a scrape for a tracked job and persist results to the database."""
+    await init_db()
+
+    async with session_scope() as session:
+        res = await session.execute(
+            select(TrackedJob).where(TrackedJob.is_active == True).order_by(TrackedJob.id.desc())
+        )
+        jobs = res.scalars().all()
+
+    if not jobs:
+        console.print("\n[bold red]No active tracked jobs found.[/bold red]")
+        return
+
+    console.print("\n[bold]Active jobs:[/bold]")
+    for job in jobs:
+        platforms = ", ".join(p.capitalize() for p in job.get_platforms())
+        console.print(f"  [cyan]{job.id}[/cyan]. {job.query[:40]} | {platforms}")
+
+    job_ids = [str(j.id) for j in jobs]
+    chosen_id = int(Prompt.ask("[bold yellow]Enter Job ID to scrape[/bold yellow]", choices=job_ids))
+
+    async with session_scope() as session:
+        j_res = await session.execute(select(TrackedJob).where(TrackedJob.id == chosen_id))
+        job = j_res.scalar_one()
+        platforms = job.get_platforms()
+        query = job.query
+        pages = job.pages_per_run
+        include_ads = job.include_ads
+
+    async with session_scope() as session:
+        before_res = await session.execute(
+            select(ScrapedProduct)
+            .join(ScrapeHistory, ScrapedProduct.history_id == ScrapeHistory.id)
+            .where(ScrapeHistory.job_id == chosen_id)
+        )
+        count_before = len(before_res.scalars().all())
+    console.print(f"\nProducts in DB before: [bold]{count_before}[/bold]")
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
+        progress.add_task(f"[bold]Scraping '{query}' on {', '.join(platforms)}...[/bold]", total=None)
+        scrape_result = await execute_scrape(
+            query=query,
+            platforms=platforms,
+            pages=pages,
+            include_ads=include_ads,
+        )
+
+    if scrape_result["errors"]:
+        for err in scrape_result["errors"]:
+            console.print(f"[bold red]Scraper error:[/bold red] {err}")
+
+    async with session_scope() as session:
+        history = ScrapeHistory(
+            job_id=chosen_id,
+            total_found=scrape_result["total_found"],
+            lowest_price=scrape_result["lowest_price"],
+        )
+        session.add(history)
+        await session.flush()
+        for p in scrape_result.get("products", []):
+            session.add(
+                ScrapedProduct(
+                    history_id=history.id,
+                    product_id=p.get("id"),
+                    title=p.get("title"),
+                    price=p.get("price"),
+                    url=p.get("url"),
+                    source=p.get("source"),
+                    currency=p.get("currency"),
+                    rating=p.get("rating"),
+                    review_count=p.get("review_count"),
+                )
+            )
+
+    async with session_scope() as session:
+        after_res = await session.execute(
+            select(ScrapedProduct)
+            .join(ScrapeHistory, ScrapedProduct.history_id == ScrapeHistory.id)
+            .where(ScrapeHistory.job_id == chosen_id)
+        )
+        count_after = len(after_res.scalars().all())
+
+    console.print(f"Products found this run: [bold]{scrape_result['total_found']}[/bold]")
+    console.print(f"Products in DB after:   [bold]{count_after}[/bold]  ([green]+{count_after - count_before}[/green] new)")
+
+
 async def main_logic() -> None:
     """Main async function to orchestrate the scraping process."""
     print_header()
+
+    console.print("[bold]What would you like to do?[/bold]")
+    console.print("  [cyan]1[/cyan]. Search products")
+    console.print("  [cyan]2[/cyan]. Export scrape history to Excel")
+    console.print("  [cyan]3[/cyan]. Run test scrape for a tracked job")
+
+    mode = Prompt.ask("[bold]Enter your choice[/bold]", choices=["1", "2", "3"], default="1")
+
+    if mode == "2":
+        await export_history()
+        return
+
+    if mode == "3":
+        await trigger_job_scrape()
+        return
+
     user_input = get_user_input()
 
-    scrapers = []
-    if user_input["choice"] in ["1", "3"]:
-        scrapers.append(("Amazon", AmazonScraper()))
-    if user_input["choice"] in ["2", "3"]:
-        scrapers.append(("MercadoLibre", MercadoLibreScraper(country_code="co")))
-
-    all_products = []
     with Progress(
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True
     ) as progress:
-        main_task = progress.add_task(
-            "[bold]Scraping Platforms...[/bold]", total=len(scrapers)
+        progress.add_task("[bold]Scraping Platforms...[/bold]", total=None)
+        result = await execute_scrape(
+            query=user_input["query"],
+            platforms=user_input["platforms"],
+            pages=user_input["pages"],
+            include_ads=user_input["include_ads"],
         )
 
-        for name, scraper_instance in scrapers:
-            progress.update(main_task, description=f"Scraping {name}...")
-            try:
-                results = await scraper_instance.search_products(
-                    user_input["query"], user_input["pages"]
-                )
-                if results:
-                    all_products.extend(results)
-                logger.info(
-                    f"Scraper '{name}' finished and found {len(results) if results else 0} products."
-                )
-            except Exception as e:
-                logger.error(f"Scraper '{name}' failed entirely: {e}", exc_info=True)
-            progress.advance(main_task)
+    final_products = result["products"]
 
-    final_products = smart_deduplicate(all_products)
+    if result["errors"]:
+        for err in result["errors"]:
+            console.print(f"[bold red]Error:[/bold red] {err}")
+
     display_results_table(final_products)
 
     if (

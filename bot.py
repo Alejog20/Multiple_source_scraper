@@ -17,6 +17,7 @@ Environment variables (loaded from .env):
 
 import asyncio
 import html
+import io
 import logging
 import os
 import re
@@ -63,7 +64,7 @@ from telegram.ext import (
 )
 
 from core_engine import execute_scrape
-from database import ScrapeHistory, TrackedJob, init_db, session_scope
+from database import ScrapedProduct, ScrapeHistory, TrackedJob, init_db, session_scope
 
 # ---------------------------------------------------------------------------
 # Bootstrap — logging first, everything else after
@@ -132,7 +133,7 @@ PAGES_PER_SCRAPE: int = int(os.getenv("PAGES_PER_SCRAPE", "2"))
 # ConversationHandler state constants
 # ---------------------------------------------------------------------------
 
-PLATFORM, QUERY, FREQUENCY, INTERVAL_DAYS, TIMES, DURATION = range(6)
+PLATFORM, QUERY, FREQUENCY, INTERVAL_DAYS, TIMES, PAGES, ADS, DURATION = range(8)
 
 # ---------------------------------------------------------------------------
 # MarkdownV2 helper
@@ -182,6 +183,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/track  – Deploy a new tracking job\n"
         "/list   – View your active jobs\n"
         "/stop   – Cancel a running job\n"
+        "/export – Download history for a job as an Excel file\n"
         "/help   – Show this message"
     )
 
@@ -220,6 +222,115 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /export — command + callback
+# ---------------------------------------------------------------------------
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = str(update.effective_chat.id)
+    async with session_scope() as session:
+        result = await session.execute(
+            select(TrackedJob)
+            .where(TrackedJob.chat_id == chat_id)
+            .order_by(TrackedJob.created_at.desc())
+            .limit(10)
+        )
+        jobs = result.scalars().all()
+
+    if not jobs:
+        await update.message.reply_text("No tracking jobs found to export.")
+        return
+
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"#{job.id} — {job.query[:30]} ({'active' if job.is_active else 'ended'})",
+            callback_data=f"export:{job.id}",
+        )]
+        for job in jobs
+    ]
+    await update.message.reply_text(
+        "Select a job to export its scrape history as Excel:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    job_id = int(query.data.split(":")[1])
+    chat_id = str(update.effective_chat.id)
+
+    async with session_scope() as session:
+        result = await session.execute(select(TrackedJob).where(TrackedJob.id == job_id))
+        job = result.scalar_one_or_none()
+
+    if job is None or job.chat_id != chat_id:
+        await query.edit_message_text("Job not found or access denied.")
+        return
+
+    async with session_scope() as session:
+        result = await session.execute(
+            select(ScrapedProduct)
+            .join(ScrapeHistory, ScrapedProduct.history_id == ScrapeHistory.id)
+            .where(ScrapeHistory.job_id == job_id)
+            .order_by(ScrapeHistory.timestamp.asc(), ScrapedProduct.id.asc())
+        )
+        products = result.scalars().all()
+
+    if not products:
+        await query.edit_message_text(f"Job #{job_id} has no recorded products yet.")
+        return
+
+    import pandas as pd
+
+    records = [
+        {
+            "id": p.product_id,
+            "title": p.title,
+            "price": p.price,
+            "url": p.url,
+            "source": p.source,
+            "currency": p.currency,
+            "rating": p.rating,
+            "review_count": p.review_count,
+        }
+        for p in products
+    ]
+    df = pd.DataFrame(records)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        meta = pd.DataFrame([{
+            "Job ID": job.id,
+            "Query": job.query,
+            "Platforms": ", ".join(job.get_platforms()),
+            "Schedule": job.schedule_type,
+            "Pages per run": job.pages_per_run,
+            "Include ads": job.include_ads,
+            "Active": job.is_active,
+            "Expires": job.expiration_date.strftime("%Y-%m-%d"),
+        }])
+        meta.to_excel(writer, index=False, sheet_name="Job Info")
+        df.to_excel(writer, index=False, sheet_name="Products")
+        ws = writer.sheets["Products"]
+        for col in ws.columns:
+            max_len = max(len(str(cell.value or "")) for cell in col)
+            ws.column_dimensions[col[0].column_letter].width = max(12, max_len + 2)
+
+    output.seek(0)
+    filename = f"history_job{job_id}_{job.query[:20].replace(' ', '_')}.xlsx"
+
+    await query.edit_message_text(f"Generating export for Job #{job_id}…")
+    await context.bot.send_document(
+        chat_id=int(chat_id),
+        document=output,
+        filename=filename,
+        caption=f"Job #{job_id} — {len(products)} product(s) | Query: {job.query[:40]}",
     )
 
 
@@ -410,6 +521,50 @@ async def times_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     context.user_data["execution_times"] = valid_times
     await update.message.reply_text(
+        "How many pages to scrape per run?\n"
+        "`0` — all available\n"
+        "`1`–`10` — limit to N pages (default: 2)"
+    )
+    return PAGES
+
+
+async def pages_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    try:
+        pages = int(text)
+        if not 0 <= pages <= 10:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "Please enter a whole number between 0 and 10 (0 = all pages)."
+        )
+        return PAGES
+
+    context.user_data["pages_per_run"] = pages
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Include ads", callback_data="ads:yes"),
+                InlineKeyboardButton("Exclude ads", callback_data="ads:no"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        "Include sponsored/advertised products in results?",
+        reply_markup=keyboard,
+    )
+    return ADS
+
+
+async def ads_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data.split(":")[1]
+    context.user_data["include_ads"] = (choice == "yes")
+
+    await query.edit_message_text(
         "How many days should this job run before expiring? (1–90):"
     )
     return DURATION
@@ -442,6 +597,8 @@ async def duration_received(
             expiration_date=expiration_date,
             is_active=True,
             interval_days=ud.get("interval_days"),
+            pages_per_run=ud.get("pages_per_run", 2),
+            include_ads=ud.get("include_ads", True),
         )
         session.add(job)
         await session.flush()  # populate job.id before commit
@@ -502,6 +659,10 @@ def build_track_conversation() -> ConversationHandler:
             TIMES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, times_received)
             ],
+            PAGES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pages_chosen)
+            ],
+            ADS: [CallbackQueryHandler(ads_chosen)],
             DURATION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, duration_received)
             ],
@@ -563,21 +724,43 @@ async def scheduled_scrape_task(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # --- Execute scrape ---
+    pages_per_run = job_data.get("pages_per_run", PAGES_PER_SCRAPE)
+    include_ads = job_data.get("include_ads", True)
     result = await execute_scrape(
         query=query_text,
         platforms=platforms,
-        pages=PAGES_PER_SCRAPE,
+        pages=pages_per_run,
+        include_ads=include_ads,
     )
 
-    # --- Persist history ---
+    # --- Persist history + individual products ---
     async with session_scope() as session:
-        session.add(
-            ScrapeHistory(
-                job_id=job_id,
-                total_found=result["total_found"],
-                lowest_price=result["lowest_price"],
-            )
+        history = ScrapeHistory(
+            job_id=job_id,
+            total_found=result["total_found"],
+            lowest_price=result["lowest_price"],
         )
+        session.add(history)
+        await session.flush()  # populate history.id before inserting products
+        for p in result.get("products", []):
+            session.add(
+                ScrapedProduct(
+                    history_id=history.id,
+                    product_id=p.get("id"),
+                    title=p.get("title"),
+                    price=p.get("price"),
+                    url=p.get("url"),
+                    source=p.get("source"),
+                    currency=p.get("currency"),
+                    rating=p.get("rating"),
+                    review_count=p.get("review_count"),
+                )
+            )
+    _logger.info(
+        "scheduled_scrape_task: job %d — history saved, %d product(s) persisted",
+        job_id,
+        len(result.get("products", [])),
+    )
 
     # --- Build & send report ---
     expiry_str = expiration_date.strftime("%Y-%m-%d") if isinstance(expiration_date, datetime) else str(expiration_date)
@@ -588,6 +771,8 @@ async def scheduled_scrape_task(context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         price_str = "N/A"
 
+    ads_note = "\n🚫 _Sponsored products excluded_" if not include_ads else ""
+
     report = (
         f"🔍 *Job \\#{_esc(str(job_id))} — Price Report*\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -597,6 +782,7 @@ async def scheduled_scrape_task(context: ContextTypes.DEFAULT_TYPE) -> None:
         f"💰 *Lowest price:* {price_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"_Tracked until: {_esc(expiry_str)}_"
+        f"{ads_note}"
     )
 
     try:
@@ -636,7 +822,12 @@ def _register_job_in_scheduler(application: Application, job: TrackedJob) -> Non
             already committed and accessible (``expire_on_commit=False``).
     """
     job_name = f"job_{job.id}"
-    job_data = {"job_id": job.id, "chat_id": job.chat_id}
+    job_data = {
+        "job_id": job.id,
+        "chat_id": job.chat_id,
+        "pages_per_run": job.pages_per_run,
+        "include_ads": job.include_ads,
+    }
 
     for time_str in job.get_execution_times():
         hour, minute = map(int, time_str.split(":"))
@@ -734,6 +925,7 @@ async def post_init(application: Application) -> None:
             BotCommand("track", "Deploy a new background tracking job"),
             BotCommand("list", "Fetch all active database records"),
             BotCommand("stop", "Terminate a running scheduled job"),
+            BotCommand("export", "Download scrape history as Excel"),
             BotCommand("help", "Access documentation and syntax guide"),
         ]
     )
@@ -759,6 +951,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CallbackQueryHandler(stop_callback, pattern=r"^stop:\d+$"))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CallbackQueryHandler(export_callback, pattern=r"^export:\d+$"))
     app.add_handler(build_track_conversation())
 
     return app
