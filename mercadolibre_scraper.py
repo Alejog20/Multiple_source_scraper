@@ -45,8 +45,11 @@ class MercadoLibreScraper:
                 logger.warning(f"[MercadoLibre] Page {page_num}: Critical failure. Stopping search.")
                 break
             all_products.extend(products)
-            if not products and page_num == 1:
-                logger.warning("[MercadoLibre] Page 1: No products found. Stopping search.")
+            if not products:
+                if page_num == 1:
+                    logger.warning("[MercadoLibre] Page 1: No products found. Stopping search.")
+                else:
+                    logger.info(f"[MercadoLibre] Page {page_num}: No more products. Search complete.")
                 break
             if page_num < max_pages:
                 await asyncio.sleep(random.uniform(1.0, 2.5))
@@ -229,6 +232,10 @@ class MercadoLibreScraper:
 
         products = []
         for item in results:
+            is_ad = (
+                item.get("position_type") == "advertising" or
+                bool(item.get("is_advertising"))
+            )
             products.append({
                 "id": item.get("id"),
                 "source": "MercadoLibre",
@@ -238,6 +245,7 @@ class MercadoLibreScraper:
                 "currency": item.get("currency_id"),
                 "rating": None,
                 "review_count": None,
+                "is_ad": is_ad,
             })
         return products
 
@@ -491,6 +499,11 @@ class MercadoLibreScraper:
                     currency = 'COP'
                 break
 
+        is_ad = (
+            "click1.mercadolibre" in (url or "") or
+            "is-advertising" in (item.attributes.get("class") or "")
+        )
+
         raw_product = {
             "id": product_id,
             "source": "MercadoLibre",
@@ -500,6 +513,7 @@ class MercadoLibreScraper:
             "currency": currency,
             "rating": None,
             "review_count": None,
+            "is_ad": is_ad,
         }
 
         validated_product = validate_product_data(raw_product)
@@ -544,6 +558,8 @@ class MercadoLibreScraper:
         elif url and url.startswith('/'):
             url = f"{self.base_url}{url}"
 
+        is_ad = "click1.mercadolibre" in (url or "")
+
         raw_product = {
             "id": product_id,
             "source": "MercadoLibre",
@@ -553,6 +569,7 @@ class MercadoLibreScraper:
             "currency": currency,
             "rating": None,
             "review_count": None,
+            "is_ad": is_ad,
         }
 
         validated_product = validate_product_data(raw_product)

@@ -139,6 +139,8 @@ class TrackedJob(Base):
     expiration_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     interval_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pages_per_run: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    include_ads: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
@@ -229,6 +231,8 @@ class ScrapeHistory(Base):
             were missing / all scrapers errored out).
         timestamp: UTC timestamp set by the database at INSERT time.
         job: Back-reference to the parent :class:`TrackedJob`.
+        products: All individual :class:`ScrapedProduct` rows recorded for
+            this run.
     """
 
     __tablename__ = "scrape_history"
@@ -247,11 +251,71 @@ class ScrapeHistory(Base):
     )
 
     job: Mapped["TrackedJob"] = relationship("TrackedJob", back_populates="history")
+    products: Mapped[list["ScrapedProduct"]] = relationship(
+        "ScrapedProduct",
+        back_populates="history",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
 
     def __repr__(self) -> str:
         return (
             f"ScrapeHistory(id={self.id!r}, job_id={self.job_id!r}, "
             f"total_found={self.total_found!r}, lowest_price={self.lowest_price!r})"
+        )
+
+
+class ScrapedProduct(Base):
+    """Stores one individual product record from a single scrape run.
+
+    Each :class:`ScrapeHistory` row can have many ``ScrapedProduct`` rows —
+    one per product returned by :func:`~core_engine.execute_scrape`. This
+    allows exporting the full, flat list of scraped items for any job.
+
+    Attributes:
+        id: Auto-incrementing primary key.
+        history_id: Foreign key to the :class:`ScrapeHistory` run that
+            produced this product. Cascades on delete.
+        product_id: Platform-native product identifier (e.g. ``"MCO123"``
+            for MercadoLibre, ASIN for Amazon). May be ``None`` if the
+            scraper could not extract one.
+        title: Product display name as scraped.
+        price: Numeric price, or ``None`` if not found.
+        url: Product page URL, or ``None``.
+        source: Platform name — ``"Amazon"`` or ``"MercadoLibre"``.
+        currency: ISO-ish currency code as returned by the scraper
+            (e.g. ``"COP"``, ``"USD"``).
+        rating: Numeric star rating, or ``None``.
+        review_count: Integer review count, or ``None``.
+        history: Back-reference to the parent :class:`ScrapeHistory` row.
+    """
+
+    __tablename__ = "scraped_products"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    history_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("scrape_history.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    product_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    currency: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    rating: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    review_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    history: Mapped["ScrapeHistory"] = relationship(
+        "ScrapeHistory", back_populates="products"
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"ScrapedProduct(id={self.id!r}, history_id={self.history_id!r}, "
+            f"product_id={self.product_id!r}, title={self.title!r})"
         )
 
 
@@ -281,6 +345,14 @@ def _apply_migrations(conn) -> None:
     if "interval_days" not in existing:
         conn.execute(
             text("ALTER TABLE tracked_jobs ADD COLUMN interval_days INTEGER")
+        )
+    if "pages_per_run" not in existing:
+        conn.execute(
+            text("ALTER TABLE tracked_jobs ADD COLUMN pages_per_run INTEGER DEFAULT 2")
+        )
+    if "include_ads" not in existing:
+        conn.execute(
+            text("ALTER TABLE tracked_jobs ADD COLUMN include_ads BOOLEAN DEFAULT 1")
         )
 
 

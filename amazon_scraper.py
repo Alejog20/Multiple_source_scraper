@@ -49,8 +49,11 @@ class AmazonScraper:
                     )
                     break
                 all_products.extend(products)
-                if not products and page_num == 1:
-                    logger.warning("[Amazon] Page 1: No products found after all strategies. Stopping search.")
+                if not products:
+                    if page_num == 1:
+                        logger.warning("[Amazon] Page 1: No products found after all strategies. Stopping search.")
+                    else:
+                        logger.info(f"[Amazon] Page {page_num}: No more products. Search complete.")
                     break
 
         final_products = self._deduplicate(all_products)
@@ -355,6 +358,13 @@ class AmazonScraper:
         if not url:
             url = f"{self.base_url}/dp/{asin}"
 
+        is_ad = bool(
+            item.css_first('.puis-sponsored-label-info-icon') or
+            item.css_first('.s-sponsored-label-info-icon') or
+            item.css_first('[aria-label="Sponsored"]') or
+            item.css_first('[aria-label="Patrocinado"]')
+        )
+
         raw_product = {
             "id": asin,
             "source": "Amazon",
@@ -364,6 +374,7 @@ class AmazonScraper:
             "currency": get_text("span.a-price-symbol", default="$"),
             "rating": rating,
             "review_count": review_count,
+            "is_ad": is_ad,
         }
 
         validated_product = validate_product_data(raw_product)

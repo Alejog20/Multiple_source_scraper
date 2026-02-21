@@ -193,19 +193,20 @@ async def export_history() -> None:
         job = j_result.scalar_one()
 
         p_result = await session.execute(
-            select(ScrapedProduct)
+            select(ScrapedProduct, ScrapeHistory.timestamp)
             .join(ScrapeHistory, ScrapedProduct.history_id == ScrapeHistory.id)
             .where(ScrapeHistory.job_id == chosen_id)
             .order_by(ScrapeHistory.timestamp.asc(), ScrapedProduct.id.asc())
         )
-        products = p_result.scalars().all()
+        rows = p_result.all()
 
-    if not products:
+    if not rows:
         console.print(f"\n[bold red]Job #{chosen_id} has no recorded products yet.[/bold red]")
         return
 
     records = [
         {
+            "scraped_at": ts.strftime("%m/%d/%Y %H:%M") if ts else "",
             "id": p.product_id,
             "title": p.title,
             "price": p.price,
@@ -215,7 +216,7 @@ async def export_history() -> None:
             "rating": p.rating,
             "review_count": p.review_count,
         }
-        for p in products
+        for p, ts in rows
     ]
     df = pd.DataFrame(records)
 
@@ -244,7 +245,7 @@ async def export_history() -> None:
                 ws.column_dimensions[col[0].column_letter].width = max(12, max_len + 2)
 
         console.print(
-            f"\n[bold green]Exported {len(products)} product(s) to "
+            f"\n[bold green]Exported {len(rows)} product(s) to "
             f"[underline]{filename}[/underline][/bold green]"
         )
     except Exception as e:

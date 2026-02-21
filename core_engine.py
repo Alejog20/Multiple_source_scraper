@@ -73,6 +73,11 @@ increase the capacity::
 # Supported platform identifiers. Used for validation and dispatch.
 _SUPPORTED_PLATFORMS: frozenset[str] = frozenset({"amazon", "mercadolibre"})
 
+_MAX_AUTO_PAGES: int = 50
+"""Pages ceiling used when the caller requests 'all pages' (pages=0).
+With the stop-on-empty fix in each scraper, the actual number of pages
+fetched will always be much less; 50 is just a safety ceiling."""
+
 # ---------------------------------------------------------------------------
 # Return type
 # ---------------------------------------------------------------------------
@@ -115,6 +120,7 @@ async def execute_scrape(
     query: str,
     platforms: list[str],
     pages: int,
+    include_ads: bool = True,
 ) -> ScrapeResult:
     """Run a price-search across the requested platforms and return merged results.
 
@@ -144,7 +150,10 @@ async def execute_scrape(
         pages: Number of result pages to fetch per platform. Each platform
             interprets this differently (Amazon: web pages; MercadoLibre: API
             pages of 50 items each). Capped at 10 by callers to prevent
-            runaway memory use.
+            runaway memory use. ``pages=0`` means auto (up to
+            ``_MAX_AUTO_PAGES``).
+        include_ads: When ``False``, removes tagged sponsored products from
+            results after scraping.
 
     Returns:
         A :class:`ScrapeResult` TypedDict with keys ``products``,
@@ -165,11 +174,15 @@ async def execute_scrape(
     all_products: list[dict[str, Any]] = []
     errors: list[str] = []
 
+    effective_pages = _MAX_AUTO_PAGES if pages == 0 else pages
+
     _logger.info(
-        "execute_scrape: query=%r platforms=%r pages=%d — waiting for semaphore",
+        "execute_scrape: query=%r platforms=%r pages=%d (effective=%d) include_ads=%r — waiting for semaphore",
         query,
         platforms,
         pages,
+        effective_pages,
+        include_ads,
     )
 
     # Acquire the semaphore. All subsequent work happens inside this block.
@@ -197,7 +210,7 @@ async def execute_scrape(
                 products = await _scrape_platform(
                     platform=platform_lower,
                     query=query,
-                    pages=pages,
+                    pages=effective_pages,
                 )
                 _logger.info(
                     "execute_scrape: platform=%r returned %d products",
@@ -225,6 +238,14 @@ async def execute_scrape(
     # no browser or network I/O, so there's no reason to hold the lock.
     deduplicated = _deduplicate_products(all_products)
     validated = [p for p in (validate_product_data(p) for p in deduplicated) if p]
+    validated = _filter_by_query_relevance(validated, query)
+
+    if not include_ads:
+        before_count = len(validated)
+        validated = [p for p in validated if not p.get("is_ad", False)]
+        ads_removed = before_count - len(validated)
+        _logger.info("execute_scrape: ads_removed=%d", ads_removed)
+
     lowest_price = _compute_lowest_price(validated)
 
     _logger.info(
@@ -318,6 +339,62 @@ def _deduplicate_products(
         if product_id and product_id not in seen:
             seen[product_id] = product
     return list(seen.values())
+
+
+_RELEVANCE_STOP_WORDS: frozenset[str] = frozenset({
+    "the", "a", "an", "and", "or", "for", "of", "in", "on", "at", "to",
+    "with", "de", "la", "el", "en", "y", "con",
+})
+
+
+def _filter_by_query_relevance(
+    products: list[dict[str, Any]],
+    query: str,
+) -> list[dict[str, Any]]:
+    """Keep only products whose title contains all significant query keywords.
+
+    Eliminates noise results that share a brand/model prefix but ignore the
+    rest of the query (e.g. bare 'Sigma' results when searching 'Sigma 18-50 mm').
+
+    Tokenisation: split on whitespace, lowercase, drop stop-words and
+    single-character tokens. Each remaining keyword must appear as a
+    case-insensitive substring of the product title.
+
+    Substring matching (not word-boundary) is intentional: spec tokens like
+    "18-50" appear embedded in compound words such as "18-50mm" and a
+    word-boundary regex would miss them.
+
+    Returns products unchanged if the query yields fewer than two meaningful
+    keywords (single-token queries need no narrowing).
+    """
+    import re
+
+    raw_tokens = re.split(r"[\s,;]+", query.strip())
+    keywords = [
+        t.lower()
+        for t in raw_tokens
+        if len(t) >= 2 and t.lower() not in _RELEVANCE_STOP_WORDS
+    ]
+
+    if len(keywords) < 2:
+        return products
+
+    kept, removed = [], 0
+    for product in products:
+        title = (product.get("title") or "").lower()
+        if all(kw in title for kw in keywords):
+            kept.append(product)
+        else:
+            removed += 1
+
+    if removed:
+        _logger.info(
+            "filter_by_query_relevance: removed=%d, kept=%d, query=%r",
+            removed,
+            len(kept),
+            query,
+        )
+    return kept
 
 
 def _compute_lowest_price(

@@ -1,294 +1,477 @@
-# Multi-Platform E-Commerce Scraper - Version 2.0
+# Multi-Platform E-Commerce Scraper — Version 4.1
 
 ## 1. Project Status & Overview
 
-This project represents an academic project for multi-platform scraper, completely using modern Python architecture. This version addresses failures through comprehensive data validation, and a robust offline testing framework.
+A multi-platform price-tracking system built in Python. It exposes two interfaces — a rich CLI (`main.py`) for one-shot searches and history exports, and a Telegram bot (`bot.py`) for persistent, scheduled background jobs with in-chat XLSX exports — both powered by the same `core_engine.py` business logic layer.
 
-The scraper validates all extracted data, and employs sophisticated multi-layered strategies for maximum success rates.
+The scrapers employ a 5-layer resilience funnel per page, validate all extracted data, filter results by query relevance, and natively detect and optionally filter sponsored/advertised listings.
 
-### **What's New in Version 2.0**
+---
+
+### What's New in Version 4.1
+
+**Query-relevance filter (`core_engine.py`):**
+- After scraping and validation, results are now filtered to keep only products whose title contains **all significant keywords** from the search query.
+- Eliminates noise caused by broad brand/category matches — e.g., searching "Sigma 18-50 mm" no longer returns bare "Sigma 30mm" or "Sigma 85mm" listings.
+- Uses case-insensitive substring matching so compound spec tokens like "18-50" correctly match titles that write it as "18-50mm".
+- Common stop-words (English and Spanish) are excluded from the keyword set; single-token queries bypass the filter entirely.
+- Removed count is reported in the application log at `INFO` level.
+
+**`scraped_at` timestamp column — CLI Mode 2 Products sheet:**
+- The "Products" sheet in the CLI history export now includes a `scraped_at` column as the first column (column A).
+- Format: `MM/DD/YYYY HH:MM` (UTC), sourced from the `ScrapeHistory.timestamp` of the run that produced each product row.
+- Enables time-series price analysis directly inside Excel when a job has been scraped multiple times.
+
+---
+
+### What's New in Version 4.0
+
+**History XLSX Export — Bot `/export` command:**
+- New `/export` command shows an inline keyboard listing the user's 10 most recent jobs (both active and ended).
+- Selecting a job causes the bot to send that job's full `scrape_history` as an in-memory XLSX document directly in chat — no temp files, no disk I/O on the server.
+- The XLSX contains two sheets: **"Job Info"** (one row of job metadata) and **"Scrape History"** (one row per scheduled run with timestamp, products found, and lowest price). Column widths are auto-fitted.
+- Ownership is verified: users can only export their own jobs.
+
+**History XLSX Export — CLI mode menu:**
+- `main.py` now opens with a top-level mode prompt: **1 = Search products** (existing flow, unchanged) or **2 = Export scrape history to Excel**.
+- Mode 2 lists all jobs from the local database, lets the user pick one by ID, and writes the same two-sheet XLSX to disk.
+
+---
+
+### What's New in Version 3.0
+
+**Auto-Pagination:**
+- Both scrapers now stop as soon as any page returns zero results, rather than running through all requested pages unnecessarily.
+- A new "all pages" mode (`pages=0` in CLI, `0` in the bot) automatically pages until the site returns nothing, using a 50-page safety ceiling.
+
+**Ad / Sponsored Product Filtering:**
+- Every product is now tagged with `is_ad: bool` at extraction time.
+- Amazon: detected via `.puis-sponsored-label-info-icon`, `.s-sponsored-label-info-icon`, and `aria-label="Sponsored"/"Patrocinado"` CSS selectors.
+- MercadoLibre: detected via `position_type == "advertising"` / `is_advertising` in the API response; `click1.mercadolibre` URL pattern and `is-advertising` CSS class in HTML paths.
+- `execute_scrape(include_ads=False)` filters tagged products after scraping.
+- CLI prompts whether to include or exclude ads. Bot `/track` conversation includes an inline keyboard for the same choice.
+
+**Telegram Bot — Scheduled Price Tracking:**
+- Users deploy background jobs via `/track`. Each job stores its own `pages_per_run` and `include_ads` settings.
+- Scheduled scrapes run at user-defined times (daily, weekly, or every N days), persist history to SQLite, and deliver formatted MarkdownV2 price reports to the user's chat.
+- Reports append "🚫 Sponsored products excluded" when ads are filtered.
+
+**Single Scrape Entry Point:**
+- `core_engine.execute_scrape()` is now the only way all callers (CLI, bot scheduler, tests) invoke scraping. Direct scraper instantiation in `main.py` has been removed.
+
+---
+
+### What's New in Version 2.0
 
 **Revolutionary Anti-Detection:**
-- **Playwright-Stealth Integration:** Browser fingerprint masking
-- **Enhanced Browser Headers:** Sec-ch-ua realistic fingerprinting
-- **Intelligent Retry Logic:** Exponential backoff with smart error classification
-- **Dynamic User-Agent Pools:** Latest browser versions with mobile/desktop variants
+- Playwright-Stealth integration: browser fingerprint masking.
+- Enhanced browser headers: `sec-ch-ua` realistic fingerprinting.
+- Intelligent retry logic: exponential backoff with smart error classification.
+- Dynamic user-agent pools: latest browser versions with mobile/desktop variants.
 
 **Critical Parser Fixes:**
-- **MercadoLibre Title Extraction:** Fixed to correctly extract from `img[title]` attributes
-- **Enhanced Selector Robustness:** Multiple fallback selectors for all data points
-- **Advanced Price Parsing:** Handles Colombian peso format and complex price structures
-- **URL & ID Extraction:** Improved pattern matching for product identification
+- MercadoLibre title extraction: fixed to correctly extract from `img[title]` attributes.
+- Enhanced selector robustness: multiple fallback selectors for all data points.
+- Advanced price parsing: handles Colombian peso format and complex price structures.
+- URL & ID extraction: improved pattern matching for product identification.
 
 **Architecture:**
-- **Modern Python Typing:** Type annotations throughout codebase
-- **Comprehensive Data Validation:** Field-level validation with type checking
-- **Modular Design:** Clear separation of concerns with maintainable code structure
-
-**Current Functionality:**
--   **Multi-Platform:** Scrapes product data with advanced parsing
--   **Stealth Evasion:** Integrates `playwright-stealth`
--   **Resilient:** 5-layer strategy funnel with intelligent retry mechanisms
--   **Self-Validating:** Comprehensive `unittest` framework with offline HTML testing
--   **Asynchronous:** High-performance async architecture with `httpx` and `playwright`
--   **Production-Ready:** Clean, typed codebase following Python best practices
--   **Comprehensive Logging:** Detailed execution logs with intelligent error reporting
+- Modern Python typing throughout the codebase.
+- Comprehensive data validation with field-level type checking.
+- Modular design with clear separation of concerns.
 
 ---
 
 ## 2. Core Architecture: The 5-Layer Resilience Funnel
 
-The scraper's intelligence lies in its strategy funnel. For every single page it needs to scrape, it follows this sequence, stopping as soon as it successfully retrieves valid data. This ensures maximum efficiency and respect for the target servers.
+For every page it needs to scrape, each scraper follows this sequence and stops as soon as it retrieves valid data.
 
+1. **Cache First:** Checks a local `.cache` folder for recent results to avoid redundant requests.
+2. **API Request (MercadoLibre only):** Fetches clean JSON directly from MercadoLibre's public API.
+3. **Enhanced Desktop HTTPX Request:** Sophisticated requests with modern browser headers and exponential backoff.
+4. **Mobile HTTPX Request:** Mobile browser simulation, often bypassing desktop-focused detection.
+5. **Advanced Stealth Browser Emulation:** Playwright-stealth with anti-detection scripts, realistic viewport, and human-like delays.
 
-
-1.  **Cache First:** Checks a local `.cache` folder for recent results to avoid redundant requests and reduce server load.
-2.  **API Request (MercadoLibre only):** Attempts to fetch clean JSON data directly from MercadoLibre's public API with proper error handling.
-3.  **Enhanced Desktop HTTPX Request:** Makes sophisticated requests with modern browser headers (sec-ch-ua, sec-fetch-*) and intelligent retry logic with exponential backoff.
-4.  **Mobile HTTPX Request:** Fallback mobile browser simulation with mobile-specific headers and user agents, often bypassing desktop-focused detection.
-5.  **Advanced Stealth Browser Emulation:** Deploys `playwright-stealth` with custom anti-detection scripts, realistic viewport settings, and human-like delays to defeat sophisticated bot detection systems.
+**Stop condition (v3.0):** If a page returns zero products, the scraper stops immediately regardless of how many pages were requested. This applies both to mid-run "content exhausted" situations and to hard failures on page 1.
 
 ---
 
-## 3. Data Flow Diagram
+## 3. System Architecture
 
-This diagram illustrates the project's complete operational flow from start to finish.
+```
+┌─────────────────────────────────────────────────────────┐
+│                        Interfaces                       │
+│                                                         │
+│    CLI (main.py)              Telegram Bot (bot.py)     │
+│    • Mode 1: One-shot search  • /track conversation     │
+│    • Platform select          • Scheduled JobQueue      │
+│    • pages=0 (all)            • pages per job           │
+│    • include_ads prompt       • ads inline keyboard     │
+│    • Mode 2: Export history   • /export → XLSX in chat  │
+└──────────────────┬───────────────────┬──────────────────┘
+                   │                   │
+                   ▼                   ▼
+        ┌─────────────────────────────────────┐
+        │         core_engine.py              │
+        │   execute_scrape(query, platforms,  │
+        │       pages, include_ads)           │
+        │   • pages=0 → _MAX_AUTO_PAGES (50)  │
+        │   • sequential platform loop        │
+        │   • dedup → validate → relevance     │
+        │     filter → filter ads             │
+        │   • _browser_semaphore (cap=1)       │
+        └────────────┬──────────────┬─────────┘
+                     │              │
+          ┌──────────▼──┐     ┌─────▼────────────┐
+          │amazon_scraper│    │mercadolibre_scraper│
+          │  is_ad via   │    │  is_ad via API     │
+          │  CSS labels  │    │  field / URL / CSS │
+          └─────────────┘     └──────────────────┘
+                                       │
+                          ┌────────────▼────────────┐
+                          │       database.py        │
+                          │  TrackedJob              │
+                          │  • pages_per_run         │
+                          │  • include_ads           │
+                          │  ScrapeHistory           │
+                          └─────────────────────────┘
+```
+
+---
+
+## 4. Data Flow Diagram — CLI
 
 ```plaintext
-+--------------------------+
-|   Start: python main.py  |
-+--------------------------+
++-----------------------------+
+|   Start: uv run python      |
+|         main.py             |
++-----------------------------+
              |
              v
-+--------------------------+
-|  Dependency Check &      |
-|  Initial Setup           |
-+--------------------------+
++-----------------------------+
+|  Dependency Check & Setup   |
++-----------------------------+
              |
              v
-+--------------------------+
-|  Display UI & Get User   |
-|  Input (Query, Pages)    |
-+--------------------------+
++-----------------------------+
+|  Mode Menu                  |
+|  1. Search products         |
+|  2. Export scrape history   |
++-----------------------------+
              |
-             v
-+--------------------------+
-|  Initialize Scraper(s)   |
-|  (Amazon, MercadoLibre)  |
-+--------------------------+
+      +------+------+
+      |             |
+  Mode 1        Mode 2
+      |             |
+      v             v
++----------+  +----------------------------+
+|  Get     |  |  Load all TrackedJobs      |
+|  User    |  |  from DB; display list     |
+|  Input   |  |  → pick Job ID             |
++----------+  |  → fetch ScrapeHistory     |
+      |       |  → write two-sheet .xlsx   |
+      v       |    (Job Info + History)    |
++-----------------------------+  +--------+
+|  core_engine.execute_scrape |
+|  (single entry point)       |
++-----------------------------+
              |
-             | For each page to scrape...
+             | For each platform, for each page...
              v
 +--------------------------------------------------+
 |           Execute 5-Layer Strategy Funnel          |
 |--------------------------------------------------|
-| 1. Cache Check -> [Found?] --(Yes)--> Success    |
-|      | (No)                                      |
+| 1. Cache Check -> [Hit?] --(Yes)--> Success      |
+|      | (Miss)                                    |
 |      v                                           |
-| 2. API Request (ML) -> [Success?] --(Yes)--> Success |
+| 2. API Request (ML only) -> [OK?] --> Success    |
 |      | (Fail/Skip)                               |
 |      v                                           |
-| 3. Desktop HTTPX -> [Valid Data?] --(Yes)--> Success|
+| 3. Desktop HTTPX -> [Valid?] --> Success         |
 |      | (Fail/Blocked)                            |
 |      v                                           |
-| 4. Mobile HTTPX -> [Valid Data?] --(Yes)--> Success |
+| 4. Mobile HTTPX -> [Valid?] --> Success          |
 |      | (Fail/Blocked)                            |
 |      v                                           |
-| 5. Stealth Playwright -> [Valid Data?] --(Yes)--> Success|
+| 5. Stealth Playwright -> [Valid?] --> Success    |
 |      | (Fail)                                    |
 |      v                                           |
-|   [Page Failed]                                  |
+| [Page empty / failed] --> stop if 0 results      |
 +--------------------------------------------------+
              |
-             | After all pages are attempted...
              v
-+--------------------------+
-|  Aggregate & Deduplicate |
-|  All Found Products      |
-+--------------------------+
++-----------------------------+
+|  Deduplicate + Validate     |
+|  Query-Relevance Filter     |
+|  Filter ads if requested    |
++-----------------------------+
              |
              v
-+--------------------------+
-|  Display Results Table   |
-|  in Console              |
-+--------------------------+
++-----------------------------+
+|  Display Results Table      |
++-----------------------------+
              |
              v
-+--------------------------+
-|  Prompt to Export?       |
-|  (Yes/No)                |
-+--------------------------+
++-----------------------------+
+|  Prompt: Export to Excel?   |
++-----------------------------+
              |
         (Yes)|
              v
-+--------------------------+
-|  Export to Excel File    |
-+--------------------------+
-             |
-             v
-+--------------------------+
-|           End            |
-+--------------------------+
++-----------------------------+
+|  Export to .xlsx            |
++-----------------------------+
 ```
 
 ---
 
-## 4. Project Structure (File Breakdown)
+## 5. Project Structure (File Breakdown)
 
-**main.py**: The main entry point and orchestrator with modern Python typing. Handles user interaction, calls the scrapers, manages data aggregation and Excel export functionality.
-
-**amazon_scraper.py**: Contains the AmazonScraper class with enterprise-grade anti-detection features. Implements playwright-stealth integration, enhanced selector logic, and comprehensive data extraction for Amazon's complex anti-bot systems.
-
-**mercadolibre_scraper.py**: Contains the MercadoLibreScraper class with advanced parsing capabilities. Features API-first strategy, fixed img[title] extraction, Colombian peso handling, and robust selector fallbacks.
-
-**debug_utils.py**: Comprehensive utility module containing enhanced browser fingerprinting, intelligent retry mechanisms, modern user-agent pools, caching system, data validation, and logging infrastructure.
-
-**test_scrapers.py**: Complete unittest framework for offline validation. Tests all parsing logic against static HTML files, includes edge case handling, data validation testing, and integration tests for cache and headers.
-
-**test_data/**: Directory containing realistic HTML test files (amazon_test_page.html, mercadolibre_test_page.html) that mirror current website structures for comprehensive offline testing.
-
-**.claude/**: Claude Code configuration directory with project-specific settings and development guidelines.
-
-**CLAUDE.md**: Development commands and workflow documentation for Claude Code integration.
+| File | Purpose |
+|---|---|
+| `main.py` | CLI entry point. Opens with a mode menu (1 = search, 2 = export history). Mode 1: collects user input, calls `execute_scrape`, displays results, optional Excel export. Mode 2: lists all DB jobs, writes a two-sheet XLSX to disk. |
+| `core_engine.py` | Business logic layer — the single scrape entry point for all callers. Orchestrates platform execution sequentially, handles `pages=0` auto mode, deduplicates, validates, filters by query relevance, filters ads. Module-level `_browser_semaphore` prevents concurrent Playwright instances. |
+| `amazon_scraper.py` | `AmazonScraper` class. 5-layer funnel (cache → desktop HTTPX → mobile HTTPX → Playwright). Tags each product with `is_ad` via sponsored label CSS selectors. |
+| `mercadolibre_scraper.py` | `MercadoLibreScraper` class. 5-layer funnel (cache → API → curl_cffi HTML → Playwright). Tags `is_ad` via API fields, URL pattern, and `is-advertising` CSS class. |
+| `bot.py` | Telegram bot. ConversationHandler for `/track` (8 states). Scheduled JobQueue with per-job settings. MarkdownV2 price reports. `/export` command sends job history as an in-memory XLSX document to chat. |
+| `database.py` | SQLAlchemy 2.x async persistence. `TrackedJob` (includes `pages_per_run`, `include_ads`) and `ScrapeHistory` models. Auto-migration via `_apply_migrations`. |
+| `debug_utils.py` | Shared utilities: browser fingerprinting, retry logic, user-agent pools, file cache, data validation, logging infrastructure. **Do not modify.** |
+| `tests/` | Unittest framework for offline validation against static HTML fixtures. |
+| `agent_docs/AGENT_DOCS.md` | AI agent context file — documents architecture, conventions, and current feature state for AI-assisted development sessions. |
 
 ---
 
-## 5. Detailed Setup & Usage Instructions
+## 6. Setup & Usage
 
-### Step 1: Clone the Project
+### Prerequisites
+- Python 3.11+
+- `uv` (recommended) or `pip`
+- A Telegram bot token from [@BotFather](https://t.me/BotFather) (bot mode only)
+
+### Step 1: Clone
 ```bash
-git clone <github.com/Alejog20/Multiple_source_scraper>
-cd <repository-directory>
+git clone https://github.com/Alejog20/Ethical_amazon_scraper
+cd Ethical_amazon_scraper
 ```
 
-### Step 2: Set Up a Virtual Environment
+### Step 2: Install dependencies
 ```bash
-# Create the environment
-python -m venv .venv
+# With uv (recommended)
+uv sync
 
-# Activate it (macOS/Linux)
-source .venv/bin/activate
-
-# Activate it (Windows)
-.venv\Scripts\activate
+# Or with pip
+pip install -r requirements.txt
 ```
 
-### Step 3: Install Required Python Libraries
-Install all necessary packages with one command:
-
+### Step 3: Install Playwright browsers
 ```bash
-pip install pandas openpyxl rich httpx selectolax playwright playwright-stealth
+playwright install chromium
 ```
 
-### Step 4: Install Browser Drivers for Playwright
-This is a mandatory one-time setup for Playwright. It downloads the browser binaries needed for automation.
-
-```bash
-playwright install
+### Step 4: Configure environment (bot mode only)
+Create a `.env` file in the project root:
+```env
+TELEGRAM_BOT_TOKEN=your_token_here
+PAGES_PER_SCRAPE=2        # fallback default if job has no per-job setting
+DB_ECHO=false             # set to true to log all SQL
 ```
-
-### Step 5: Run the Scraper
-Execute the main script from your terminal:
-
-```bash
-python main.py
-```
-Follow the on-screen prompts to select your platform, enter a search query, and specify the number of pages.
 
 ---
 
-## 6. Running the Unit Tests
+## 7. Running the CLI
 
-The comprehensive unit testing framework validates all parsing logic offline using static HTML files. This prevents silent failures and ensures scrapers work correctly when websites change.
-
-### Run All Tests
 ```bash
-python test_scrapers.py
+uv run python main.py
 ```
 
-### Run Specific Test Categories
-```bash
-# Test specific scraper
-python -m unittest test_scrapers.TestAmazonScraper -v
-python -m unittest test_scrapers.TestMercadoLibreScraper -v
+You will first be asked which mode to use:
 
-# Test data validation
-python -m unittest test_scrapers.TestDataValidation -v
-
-# Test integration components
-python -m unittest test_scrapers.TestScraperIntegration -v
+```
+What would you like to do?
+  1. Search products
+  2. Export scrape history to Excel
 ```
 
-### Test Coverage
-The test suite covers:
-- **HTML Parsing:** Validates extraction from realistic HTML structures
-- **Data Validation:** Ensures all extracted data meets quality standards
-- **Edge Cases:** Tests handling of missing prices, invalid data, CAPTCHA detection
-- **Integration:** Validates caching, headers, user-agents, and retry mechanisms
-- **Cross-Platform:** Tests both Amazon and MercadoLibre parsing logic
+**Mode 1 — Search products:** you will be prompted for:
+1. **Platform** — Amazon (1), MercadoLibre (2), or Both (3)
+2. **Search query** — e.g. `laptop gaming`
+3. **Pages** — `0` = all available pages (stops when empty), `1–10` = fixed limit
+4. **Include ads?** — `y` keeps sponsored results; `n` filters them out
 
-You should see output indicating all tests passed. Failed tests indicate website structure changes requiring selector updates.
+Results are shown in a sorted table (top 30 by price). An optional Excel export is offered at the end.
 
----
-
-## 7. Technical Implementation Details
-
-### Anti-Detection Technologies
-- **Playwright-Stealth:** Automatically patches common automation detection points
-- **Browser Fingerprinting:** Modern sec-ch-ua headers matching real browser signatures
-- **Request Patterns:** Human-like delays and realistic request timing
-- **Error Classification:** Smart retry logic for temporary vs. permanent failures
-
-### Data Quality Assurance
-- **Multi-Selector Fallbacks:** Each data point has multiple extraction strategies
-- **Type Validation:** Ensures prices are numeric, titles are strings, URLs are valid
-- **Content Sanitization:** Cleans and normalizes extracted data
-- **Duplicate Detection:** Advanced deduplication using product IDs
-
-### Performance Optimizations
-- **Async Architecture:** Concurrent processing with proper resource management
-- **Intelligent Caching:** Reduces server load with time-based cache invalidation
-- **Connection Pooling:** Efficient HTTP connection reuse
-- **Memory Management:** Proper cleanup and resource disposal
-
-### Monitoring & Debugging
-- **Comprehensive Logging:** Detailed execution traces in scraper.log
-- **Error Reporting:** Granular error messages with context
-- **Debug HTML Saving:** Automatic capture of problematic pages
-- **Performance Metrics:** Request timing and success rate tracking
+**Mode 2 — Export scrape history:** displays all tracked jobs from the local database (active and ended), prompts for a Job ID, and writes a two-sheet `.xlsx` file to the current directory:
+- **Sheet 1 "Job Info"** — one row of job metadata (ID, query, platforms, schedule, pages per run, include ads, active status, expiry date)
+- **Sheet 2 "Products"** — one row per scraped product across all runs for that job, with columns: `scraped_at` (MM/DD/YYYY HH:MM UTC), `id`, `title`, `price`, `url`, `source`, `currency`, `rating`, `review_count`. The `scraped_at` column makes it straightforward to compare prices over time for the same product across multiple scrape runs.
 
 ---
 
-## 8. Version 0.1.0 Changelog
+## 8. Running the Telegram Bot
 
-### Major Improvements
--  **Fixed MercadoLibre Title Extraction** - Now correctly extracts from img[title] attributes
--  **Integrated Playwright-Stealth** - Advanced anti-detection for Amazon scraping
--  **Enhanced Browser Headers** - Modern sec-ch-ua and realistic fingerprinting
--  **Intelligent Retry Logic** - Exponential backoff with error classification
--  **Comprehensive Data Validation** - Field-level validation with type checking
--  **Modern Python Architecture** - Complete type annotations and clean code
--  **Offline Testing Framework** - Comprehensive unittest suite with static HTML
--  **Production-Ready Codebase** - Removed emojis, optimized for enterprise use
+```bash
+uv run python bot.py
+```
 
-### Breaking Changes
-- Updated Python typing requirements (Python 3.8+)
-- New dependency: playwright-stealth
-- Modified scraper initialization parameters
-- Enhanced data validation may filter more products
+### Bot Commands
 
-### Performance Improvements
-- 50% faster parsing with optimized selectors
-- Reduced memory usage through better resource management
-- Improved cache efficiency with smarter invalidation
-- Enhanced error recovery reducing failed requests
+| Command | Description |
+|---|---|
+| `/start` | Initialize the bot and show the command keyboard |
+| `/track` | Deploy a new background tracking job (8-step wizard) |
+| `/list` | View all your active jobs |
+| `/stop` | Cancel a running job via inline keyboard |
+| `/export` | Download scrape history for a job as an Excel file |
+| `/help` | Show command reference |
+
+### `/export` Flow
+
+```
+/export
+  └─ Inline keyboard lists up to 10 most recent jobs (active + ended)
+  └─ Tap a job → bot sends a .xlsx document to the chat
+       Sheet 1 "Job Info"      — metadata row (query, platforms, schedule, …)
+       Sheet 2 "Scrape History"— one row per run (timestamp, products, price)
+```
+
+Ownership is enforced: you can only export jobs you created. Jobs with no history yet return an informational message instead of a file.
+
+### `/track` Conversation Flow
+
+```
+/track
+  └─ Platform?        [Amazon] [MercadoLibre] [Both]
+  └─ Search term:     (free text)
+  └─ Frequency?       [Daily] [Every N days] [Weekly]
+  └─ Interval days?   (only for "Every N days") 1–30
+  └─ Run time(s)?     HH:MM, HH:MM  (UTC)
+  └─ Pages per run?   0=all, 1–10
+  └─ Include ads?     [Include ads] [Exclude ads]
+  └─ Duration (days)? 1–90
+```
+
+The bot schedules scrapes at the specified UTC times and sends a MarkdownV2 price report to your chat after each run. If ads are excluded, the report appends "🚫 Sponsored products excluded."
 
 ---
 
-## 9. Disclaimer & Ethical Use
+## 9. Running the Tests
 
-**For Educational Purposes Only**: This software is provided "as is" for educational and research purposes to demonstrate advanced, resilient web scraping techniques.
+```bash
+uv run python -m unittest tests/test_scheduler.py -v
+```
 
-**User Responsibility**: The user assumes all responsibility for any actions taken with this tool. It is your responsibility to comply with the Terms of Service of any website you scrape. The developers do not condone unethical use.
+The test suite validates:
+- HTML parsing logic against static fixtures
+- Data validation and edge case handling (missing prices, CAPTCHA pages)
+- Scheduler job registration and recovery
+- `execute_scrape` integration via mocked scrapers
 
-**Respectful Scraping**: This scraper incorporates multiple features (caching, delays, rotating user-agents) designed to minimize its impact. Please use this tool responsibly and avoid overloading servers.
+---
+
+## 10. Technical Implementation Details
+
+### Ad Detection Strategy
+
+| Platform | Method | Field |
+|---|---|---|
+| Amazon | CSS: `.puis-sponsored-label-info-icon` | `is_ad: bool` |
+| Amazon | CSS: `.s-sponsored-label-info-icon` | |
+| Amazon | Attr: `aria-label="Sponsored"` / `"Patrocinado"` | |
+| MercadoLibre API | `position_type == "advertising"` | `is_ad: bool` |
+| MercadoLibre API | `is_advertising` field | |
+| MercadoLibre HTML (JSON) | URL contains `click1.mercadolibre` | |
+| MercadoLibre HTML (fallback) | CSS class `is-advertising` on container | |
+
+### Pagination Stop Logic
+Both scrapers break out of their page loop when a page returns zero products. This means `pages=0` (auto mode) reliably terminates at the end of real content without hard-coding a limit, while `pages=N` terminates at whichever comes first: N pages fetched or the first empty page.
+
+### Query-Relevance Filter
+
+After deduplication and validation, `_filter_by_query_relevance()` removes products whose title does not contain every significant keyword from the original search query.
+
+| Step | Detail |
+|---|---|
+| Tokenisation | Split query on whitespace/punctuation; lowercase all tokens |
+| Stop-word removal | Skip common English/Spanish filler words (`the`, `and`, `de`, `con`, …) |
+| Length guard | Skip tokens shorter than 2 characters |
+| Single-keyword bypass | If fewer than 2 meaningful keywords remain, the filter is skipped entirely |
+| Matching | Each keyword must appear as a **substring** of the title (case-insensitive). Substring (not word-boundary) matching ensures tokens like `18-50` match compound strings like `18-50mm` |
+| Logging | Number of removed products is logged at `INFO` level: `filter_by_query_relevance: removed=X, kept=Y, query='…'` |
+
+**Example — query `"Sigma 18-50 mm"`:** keywords → `["sigma", "18-50", "mm"]`
+
+| Title | Kept? |
+|---|---|
+| Sigma 18-50mm f/2.8 DC DN Contemporary | ✓ |
+| Sigma 18-50mm Art Lens for Sony E | ✓ |
+| Sigma 30mm f/1.4 DC DN | ✗ (missing `18-50`) |
+| Sigma 85mm f/1.4 Art | ✗ (missing `18-50`) |
+| Sigma Lens Cap | ✗ (missing `18-50` and `mm`) |
+
+### Concurrency Safety
+`core_engine._browser_semaphore` (capacity 1) ensures only one `execute_scrape` call runs at a time across the whole process. This prevents concurrent Playwright instances from causing OOM kills on constrained servers. Increasing the capacity to 2 is the only change needed when moving to a higher-RAM server.
+
+### Database Schema
+
+```sql
+tracked_jobs
+  id              INTEGER PRIMARY KEY
+  chat_id         TEXT
+  query           TEXT
+  platforms       TEXT (JSON array)
+  schedule_type   TEXT  -- 'daily' | 'weekly' | 'custom_days'
+  execution_times TEXT (JSON array of 'HH:MM')
+  interval_days   INTEGER (nullable)
+  pages_per_run   INTEGER DEFAULT 2
+  include_ads     BOOLEAN DEFAULT 1
+  expiration_date DATETIME
+  is_active       BOOLEAN
+  created_at      DATETIME
+
+scrape_history
+  id            INTEGER PRIMARY KEY
+  job_id        INTEGER FK → tracked_jobs.id
+  total_found   INTEGER
+  lowest_price  FLOAT (nullable)
+  timestamp     DATETIME
+```
+
+Schema migrations run automatically on startup via `database._apply_migrations` — existing databases gain the new columns without manual intervention.
+
+---
+
+## 11. Changelog
+
+### Version 4.1
+- **Query-relevance filter:** `core_engine._filter_by_query_relevance()` strips results whose title doesn't contain all meaningful query keywords, eliminating brand-only noise (e.g. bare "Sigma" results when searching "Sigma 18-50 mm"). Uses substring matching; single-token queries bypass the filter.
+- **`scraped_at` column in Products sheet:** CLI Mode 2 export now writes the UTC scrape timestamp (`MM/DD/YYYY HH:MM`) as the first column of the "Products" sheet, enabling price-trend analysis across multiple scrape runs directly in Excel.
+- **README fix:** corrected CLI Mode 2 sheet name from "Scrape History" to "Products" and updated its column list.
+
+### Version 4.0
+- **Bot `/export` command:** inline keyboard of the user's 10 most recent jobs; sends a two-sheet XLSX (Job Info + Scrape History) as an in-memory document directly in chat. Ownership check prevents cross-user access.
+- **CLI mode menu:** `main.py` opens with a choice between "Search products" (existing flow) and "Export scrape history to Excel" (new `export_history()` function writes a matching two-sheet XLSX to disk).
+
+### Version 3.0
+- **Auto-pagination:** scrapers stop on first empty page; `pages=0` mode added to CLI and bot.
+- **Ad filtering:** `is_ad` tagging in both scrapers; `execute_scrape(include_ads=False)` post-scrape filter; CLI prompt; bot inline keyboard; report footer note.
+- **`core_engine` as single entry point:** `main.py` no longer instantiates scrapers directly.
+- **Database:** `pages_per_run` and `include_ads` columns added to `tracked_jobs`; auto-migration on startup.
+- **Bot conversation:** PAGES and ADS states inserted between TIMES and DURATION (8 total states).
+
+### Version 2.0
+- Playwright-stealth integration and enhanced anti-detection.
+- Fixed MercadoLibre title extraction from `img[title]` attributes.
+- Intelligent retry logic with exponential backoff.
+- Comprehensive data validation and offline unittest framework.
+
+### Version 0.1.0
+- Initial multi-platform scraper with Amazon and MercadoLibre support.
+
+---
+
+## 12. Disclaimer & Ethical Use
+
+**For Educational Purposes Only.** This software is provided "as is" for educational and research purposes to demonstrate advanced, resilient web scraping techniques.
+
+**User Responsibility.** The user assumes all responsibility for compliance with the Terms of Service of any website scraped. The developers do not condone unethical use.
+
+**Respectful Scraping.** Caching, random delays, and rotating user-agents are built in to minimize server impact. Use this tool responsibly.

@@ -22,4 +22,5 @@ dependencies = [
     "aiosqlite>=0.20.0",
     "python-telegram-bot[job-queue]>=21.0",
     "truststore>=0.9.1",
+    "curl-cffi>=0.7.0",
 ]
