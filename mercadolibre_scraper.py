@@ -5,7 +5,7 @@ import re
 from typing import List, Dict, Any, Optional, Tuple
 import json # Added: Required for JSON parsing
 
-import httpx
+from curl_cffi.requests import AsyncSession as CurlSession
 from selectolax.parser import HTMLParser, Node
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -37,103 +37,99 @@ class MercadoLibreScraper:
 
     async def search_products(self, query: str, max_pages: int) -> List[Dict[str, Any]]:
         logger.info(f"--- Starting MercadoLibre Search for '{query}' ---")
-        async with httpx.AsyncClient(
-            http2=True, timeout=30.0, follow_redirects=True, verify=False
-        ) as client:
-            all_products = []
-            for page_num in range(1, max_pages + 1):
-                console.log(f"[MercadoLibre] Scraping page {page_num}/{max_pages} for '{query}'...")
-                products = await self._execute_strategy_funnel(client, query, page_num)
-                if products is None:
-                    logger.warning(f"[MercadoLibre] Page {page_num}: Critical failure. Stopping search.")
-                    break
-                all_products.extend(products)
-                if not products and page_num == 1:
+        all_products = []
+        for page_num in range(1, max_pages + 1):
+            console.log(f"[MercadoLibre] Scraping page {page_num}/{max_pages} for '{query}'...")
+            products = await self._execute_strategy_funnel(query, page_num)
+            if products is None:
+                logger.warning(f"[MercadoLibre] Page {page_num}: Critical failure. Stopping search.")
+                break
+            all_products.extend(products)
+            if not products:
+                if page_num == 1:
                     logger.warning("[MercadoLibre] Page 1: No products found. Stopping search.")
-                    break
+                else:
+                    logger.info(f"[MercadoLibre] Page {page_num}: No more products. Search complete.")
+                break
+            if page_num < max_pages:
+                await asyncio.sleep(random.uniform(1.0, 2.5))
 
         final_products = self._deduplicate(all_products)
         logger.info(f"--- MercadoLibre Search Finished. Found {len(final_products)} total products. ---")
         return final_products
 
     async def _execute_strategy_funnel(
-        self, client: httpx.AsyncClient, query: str, page_num: int
+        self, query: str, page_num: int
     ) -> Optional[List[Dict[str, Any]]]:
         logger.info(f"[MercadoLibre] Page {page_num}: Executing Strategy Funnel...")
 
-        logger.info(f"[MercadoLibre] Page {page_num}: -> [ATTEMPT] Strategy 2: API Request...")
-        api_data = await self._fetch_with_api(client, query, page_num)
+        logger.info(f"[MercadoLibre] Page {page_num}: -> [ATTEMPT] Strategy 1: curl_cffi API Request...")
+        api_data = await self._fetch_with_api(query, page_num)
         if api_data:
             products = self._parse_api_data(api_data)
             if products:
-                logger.info(f"[MercadoLibre] Page {page_num}:    -> [SUCCESS] Strategy 2 SUCCEEDED. Found {len(products)} products.")
+                logger.info(f"[MercadoLibre] Page {page_num}:    -> [SUCCESS] Strategy 1 SUCCEEDED. Found {len(products)} products.")
                 return products
             logger.warning(f"[MercadoLibre] Page {page_num}:    -> [RESULT] API returned no products.")
 
-        logger.warning(f"[MercadoLibre] Page {page_num}: -> [ATTEMPT] Strategy 3: Desktop HTTPX...")
-        desktop_html = await self._fetch_with_html(client, query, page_num)
-        if desktop_html:
-            products, is_valid = self._parse_html(desktop_html)
+        logger.warning(f"[MercadoLibre] Page {page_num}: -> [ATTEMPT] Strategy 2: curl_cffi HTML...")
+        curl_html = await self._fetch_with_curl(query, page_num)
+        if curl_html:
+            products, is_valid = self._parse_html(curl_html)
+            if is_valid and products:
+                logger.info(f"[MercadoLibre] Page {page_num}:    -> [SUCCESS] Strategy 2 SUCCEEDED. Found {len(products)} products.")
+                return products
+            logger.warning(f"[MercadoLibre] Page {page_num}:    -> [RESULT] Strategy 2 FAILED. Page invalid or no products.")
+
+        logger.warning(f"[MercadoLibre] Page {page_num}: -> [ATTEMPT] Strategy 3: Playwright Full Browser...")
+        playwright_html = await self._fetch_with_playwright(query, page_num)
+        if playwright_html:
+            products, is_valid = self._parse_html(playwright_html)
             if is_valid and products:
                 logger.info(f"[MercadoLibre] Page {page_num}:    -> [SUCCESS] Strategy 3 SUCCEEDED. Found {len(products)} products.")
                 return products
             logger.warning(f"[MercadoLibre] Page {page_num}:    -> [RESULT] Strategy 3 FAILED. Page invalid or no products.")
 
-        logger.warning(f"[MercadoLibre] Page {page_num}: -> [ATTEMPT] Strategy 4: Playwright Full Browser...")
-        playwright_html = await self._fetch_with_playwright(query, page_num)
-        if playwright_html:
-            products, is_valid = self._parse_html(playwright_html)
-            if is_valid and products:
-                logger.info(f"[MercadoLibre] Page {page_num}:    -> [SUCCESS] Strategy 4 SUCCEEDED. Found {len(products)} products.")
-                return products
-            logger.warning(f"[MercadoLibre] Page {page_num}:    -> [RESULT] Strategy 4 FAILED. Page invalid or no products.")
-
         logger.error(f"[MercadoLibre] Page {page_num}: All strategies FAILED.")
         return []
 
     async def _fetch_with_api(
-        self, client: httpx.AsyncClient, query: str, page_num: int
+        self, query: str, page_num: int
     ) -> Optional[Dict[str, Any]]:
         offset = (page_num - 1) * 50
         params = {"q": query, "offset": offset, "limit": 50}
         try:
-            response = await client.get(self.api_url, params=params)
-            logger.info(f"HTTP Request: GET {response.url} \"{response.status_code} {response.reason_phrase}\"")
+            async with CurlSession(impersonate="chrome131", verify=False) as session:
+                response = await session.get(self.api_url, params=params, timeout=30)
+            logger.info(f"HTTP Request: GET {self.api_url} \"{response.status_code}\"")
             if response.status_code == 200:
                 return response.json()
             logger.warning(f"[MercadoLibre] API fetch returned status {response.status_code}")
             return None
-        except httpx.RequestError as e:
+        except Exception as e:
             logger.error(f"[MercadoLibre] API fetch failed. Error: {e}")
             return None
 
-    async def _fetch_with_html(
-        self, client: httpx.AsyncClient, query: str, page_num: int
+    async def _fetch_with_curl(
+        self, query: str, page_num: int
     ) -> Optional[str]:
         url = self._get_url(query, page_num)
-        if (html := self.cache.get(url)) is not None:
-            return html
+        if (cached := self.cache.get(url)) is not None:
+            return cached
 
         headers = get_realistic_headers(is_mobile=False)
-
-        async def make_request() -> str:
-            response = await client.get(url, headers=headers)
-            logger.info(f"HTTP Request: GET {url} \"{response.status_code} {response.reason_phrase}\"")
-
-            if response.status_code == 200:
-                self.cache.set(url, response.text)
-                return response.text
-            elif is_retryable_error(response.status_code):
-                raise httpx.HTTPStatusError(f"Retryable HTTP error: {response.status_code}", request=response.request, response=response)
-            else:
-                logger.warning(f"[MercadoLibre] HTML fetch for {url} returned non-retryable status {response.status_code}")
-                return None
-
         try:
-            result = await retry_with_backoff(make_request, max_retries=3)
-            return result
+            async with CurlSession(impersonate="chrome131", verify=False) as session:
+                response = await session.get(url, headers=headers, timeout=30, allow_redirects=True)
+            logger.info(f"HTTP Request: GET {url} \"{response.status_code}\"")
+            if response.status_code == 200:
+                html = response.text
+                self.cache.set(url, html)
+                return html
+            logger.warning(f"[MercadoLibre] curl_cffi HTML fetch returned status {response.status_code}")
+            return None
         except Exception as e:
-            logger.error(f"[MercadoLibre] HTML fetch failed for {url} after retries. Error: {e}")
+            logger.error(f"[MercadoLibre] curl_cffi HTML fetch failed for {url}. Error: {e}")
             return None
 
     async def _fetch_with_playwright(self, query: str, page_num: int) -> Optional[str]:
@@ -236,6 +232,10 @@ class MercadoLibreScraper:
 
         products = []
         for item in results:
+            is_ad = (
+                item.get("position_type") == "advertising" or
+                bool(item.get("is_advertising"))
+            )
             products.append({
                 "id": item.get("id"),
                 "source": "MercadoLibre",
@@ -245,11 +245,11 @@ class MercadoLibreScraper:
                 "currency": item.get("currency_id"),
                 "rating": None,
                 "review_count": None,
+                "is_ad": is_ad,
             })
         return products
 
     def _parse_html(self, html: str) -> Tuple[List[Dict[str, Any]], bool]:
-        tree = HTMLParser(html)
         tree = HTMLParser(html)
         script_tag = tree.css_first('script#___NEXT_DATA__') or tree.css_first('script#__NORDIC_RENDERING_CTX__')
 
@@ -259,24 +259,18 @@ class MercadoLibreScraper:
                 # For ___NEXT_DATA__, it's directly JSON
                 json_data_str = script_tag.text()
                 if script_tag.tag == 'script' and script_tag.attributes.get('id') == '__NORDIC_RENDERING_CTX__':
-                    # The script content is like 'window._n.ctx.r={...};' or '_n.ctx.r={...};'
+                    # The script content is like '_n.ctx.r={...};_n.ctx.r.assets.manifest=new Map([...])'
+                    # We only want the first JSON object after the assignment.
                     assignment_prefix = '_n.ctx.r='
                     start_idx_prefix = json_data_str.find(assignment_prefix)
                     if start_idx_prefix != -1:
                         json_data_str = json_data_str[start_idx_prefix + len(assignment_prefix):].strip()
-                        # After extracting the assigned value, ensure no trailing semicolon
-                        if json_data_str.endswith(';'):
-                            json_data_str = json_data_str[:-1]
                     else:
                         logger.error("[MercadoLibre] __NORDIC_RENDERING_CTX__ script content does not start with expected assignment.")
                         return [], False
-                
-                # DEBUG PRINT
-                # logger.info(f"DEBUG: json_data_str length: {len(json_data_str)}")
-                # logger.info(f"DEBUG: json_data_str content (first 500 chars): {json_data_str[:500]}")
-                # logger.info(f"DEBUG: json_data_str content (last 500 chars): {json_data_str[-500:]}")
-                
-                data = json.loads(json_data_str)
+
+                # Use raw_decode so trailing JS (e.g. ';_n.ctx.r.assets.manifest=new Map(...)') is ignored.
+                data, _ = json.JSONDecoder().raw_decode(json_data_str)
                 
                 # Navigate through the JSON structure to find the product results
                 products_data_raw = []
@@ -505,6 +499,11 @@ class MercadoLibreScraper:
                     currency = 'COP'
                 break
 
+        is_ad = (
+            "click1.mercadolibre" in (url or "") or
+            "is-advertising" in (item.attributes.get("class") or "")
+        )
+
         raw_product = {
             "id": product_id,
             "source": "MercadoLibre",
@@ -514,6 +513,7 @@ class MercadoLibreScraper:
             "currency": currency,
             "rating": None,
             "review_count": None,
+            "is_ad": is_ad,
         }
 
         validated_product = validate_product_data(raw_product)
@@ -558,6 +558,8 @@ class MercadoLibreScraper:
         elif url and url.startswith('/'):
             url = f"{self.base_url}{url}"
 
+        is_ad = "click1.mercadolibre" in (url or "")
+
         raw_product = {
             "id": product_id,
             "source": "MercadoLibre",
@@ -567,6 +569,7 @@ class MercadoLibreScraper:
             "currency": currency,
             "rating": None,
             "review_count": None,
+            "is_ad": is_ad,
         }
 
         validated_product = validate_product_data(raw_product)
