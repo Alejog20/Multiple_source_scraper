@@ -1,5 +1,10 @@
 # Multi-Platform E-Commerce Scraper — Version 4.1
 
+
+### Who is this for? 
+
+Individuals or teams who need price monitoring. 
+
 ## 1. Project Status & Overview
 
 A multi-platform price-tracking system built in Python. It exposes two interfaces — a rich CLI (`main.py`) for one-shot searches and history exports, and a Telegram bot (`bot.py`) for persistent, scheduled background jobs with in-chat XLSX exports — both powered by the same `core_engine.py` business logic layer.
