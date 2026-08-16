@@ -1,5 +1,6 @@
 # Multi-Platform E-Commerce Scraper — Version 4.1
 
+![Alt text](assets//1.png)
 
 ### Who is this for? 
 
@@ -26,6 +27,10 @@ The scrapers employ a 5-layer resilience funnel per page, validate all extracted
 - The "Products" sheet in the CLI history export now includes a `scraped_at` column as the first column (column A).
 - Format: `MM/DD/YYYY HH:MM` (UTC), sourced from the `ScrapeHistory.timestamp` of the run that produced each product row.
 - Enables time-series price analysis directly inside Excel when a job has been scraped multiple times.
+
+![Alt text](assets//2.png)
+
+
 
 ---
 
