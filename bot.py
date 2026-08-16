@@ -91,6 +91,7 @@ def _setup_logging() -> None:
     # core_engine import) so we don't get duplicate lines.
     for h in root.handlers[:]:
         root.removeHandler(h)
+        h.close()
 
     rich_handler = RichHandler(
         console=_console,
@@ -139,12 +140,12 @@ PLATFORM, QUERY, FREQUENCY, INTERVAL_DAYS, TIMES, PAGES, ADS, DURATION = range(8
 # MarkdownV2 helper
 # ---------------------------------------------------------------------------
 
-_MD2_SPECIAL = r"\_*[]()~`>#+-=|{}.!"
+_MD2_SPECIAL = r"\_*[]()~`>#+-=|{}.!$:"
 
 
 def _esc(text: str) -> str:
     """Escape special characters for MarkdownV2."""
-    return re.sub(r"([\_\*\[\]\(\)\~\`\>\#\+\-\=\|\{\}\.\!])", r"\\\1", str(text))
+    return re.sub(r"([\_\*\[\]\(\)\~\`\>\#\+\-\=\|\{\}\.\!\$\:])", r"\\\1", str(text))
 
 
 # ---------------------------------------------------------------------------

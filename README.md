@@ -29,6 +29,25 @@ The scrapers employ a 5-layer resilience funnel per page, validate all extracted
 
 ---
 
+### What's New in Version 4.1.1 (Stability & CI)
+
+**Fixed a segfault in Amazon page validation:**
+- `AmazonScraper._is_valid_page()` fell back to constructing a bare `selectolax.parser.Node()` (no backing document) and calling `.text()` on it whenever the "no results" selector (`h1, .a-row`) matched nothing. This is undefined behavior against the underlying C parser and could crash the entire Python process outright — non-deterministically, since it depends on adjacent heap state. Any Amazon response missing that selector (e.g. a genuinely empty or malformed page) could take down a scheduled bot run. Replaced with a proper `None` guard.
+- While fixing this, brought Amazon's `_is_valid_page()` up to parity with MercadoLibre's: it now also flags pages with under 100 characters of body text as invalid, instead of silently treating a near-empty/blocked response as "zero results" (which the auto-pagination stop logic can't distinguish from a real end-of-results).
+
+**Fixed silently dropped `price` field on validation:**
+- `debug_utils.validate_product_data()` omitted the `price` key entirely from the cleaned product dict when the source price was negative, instead of normalizing it to `None` like every other invalid-value path. Any downstream code doing `product["price"]` (CLI table rendering, Excel export) would raise `KeyError` on that product.
+
+**Fixed MarkdownV2 escaping gaps in the Telegram bot:**
+- `bot._esc()` only escaped Telegram's core MarkdownV2 special-character set and missed `$` and `:`. Since Telegram permits escaping any ASCII character 1–126 as a no-op, both are now included so prices (`$299.99`) and other punctuation render safely without risking a "can't parse entities" send failure.
+
+**Fixed a log-handler file descriptor leak:**
+- `bot._setup_logging()` removed the root logger's existing handlers on (re)configuration without closing them, leaking an open `scraper.log` file handle every time it ran.
+
+**Added CI:** a GitHub Actions workflow now runs the full test suite on every pull request (see `.github/workflows/tests.yml`).
+
+---
+
 ### What's New in Version 4.0
 
 **History XLSX Export — Bot `/export` command:**
@@ -445,6 +464,13 @@ Schema migrations run automatically on startup via `database._apply_migrations` 
 ---
 
 ## 11. Changelog
+
+### Version 4.1.1
+- **Fixed a process-crashing segfault:** `AmazonScraper._is_valid_page()` no longer constructs a bare `selectolax.parser.Node()` and calls `.text()` on it — that pattern is undefined behavior against the native parser and could kill the whole process. Also added a minimal-body-content guard, matching MercadoLibre's existing check.
+- **Fixed `validate_product_data()` dropping the `price` key** instead of setting it to `None` for negative prices, which could raise `KeyError` downstream.
+- **Fixed `bot._esc()`** to also escape `$` and `:` for MarkdownV2, preventing malformed price/report messages.
+- **Fixed a log FileHandler leak** in `bot._setup_logging()` — old handlers are now closed, not just detached.
+- **Added CI:** `.github/workflows/tests.yml` runs the full test suite on every pull request.
 
 ### Version 4.1
 - **Query-relevance filter:** `core_engine._filter_by_query_relevance()` strips results whose title doesn't contain all meaningful query keywords, eliminating brand-only noise (e.g. bare "Sigma" results when searching "Sigma 18-50 mm"). Uses substring matching; single-token queries bypass the filter.
