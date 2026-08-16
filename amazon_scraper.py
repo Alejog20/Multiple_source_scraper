@@ -241,9 +241,16 @@ class AmazonScraper:
         if tree.css_first('form[action="/errors/validateCaptcha"]'):
             logger.warning("[Amazon] Page Analysis: CAPTCHA detected.")
             return False
-        if "No results for" in (tree.css_first("h1, .a-row") or Node()).text():
+        no_results_node = tree.css_first("h1, .a-row")
+        if no_results_node and "No results for" in no_results_node.text():
             logger.warning("[Amazon] Page Analysis: 'No results' page detected.")
             return False
+
+        body_text = tree.body.text() if tree.body else ""
+        if len(body_text.strip()) < 100:
+            logger.warning("[Amazon] Page Analysis: Page has minimal content, likely invalid.")
+            return False
+
         logger.info("[Amazon] Page Analysis: Page appears valid.")
         return True
 

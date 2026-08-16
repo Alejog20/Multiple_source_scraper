@@ -61,3 +61,7 @@ htmlcov/
 
 .DS_Store
 Thumbs.db
+
+# Local-only reference docs (not committed)
+/CLAUDE.md
+/docs/

@@ -176,7 +176,8 @@ class TestScrapeResultMessageFormat(unittest.TestCase):
         self.assertIn("laptop gaming", report)
         self.assertIn("87", report)
         self.assertIn("299", report)
-        self.assertIn("2026-03-15", report)
+        # MarkdownV2 escaping: '-' in the date must be escaped or Telegram rejects the message
+        self.assertIn("2026\\-03\\-15", report)
         # MarkdownV2 escaping: $ and . should be escaped
         self.assertIn("\\$299\\.99", report)
 

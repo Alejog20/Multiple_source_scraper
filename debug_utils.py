@@ -157,8 +157,7 @@ def validate_product_data(product: Dict[str, Any]) -> Dict[str, Any]:
     if price is not None:
         try:
             price_float = float(price)
-            if price_float >= 0:  # Price can't be negative
-                cleaned["price"] = price_float
+            cleaned["price"] = price_float if price_float >= 0 else None  # Price can't be negative
         except (ValueError, TypeError):
             cleaned["price"] = None
     else:
