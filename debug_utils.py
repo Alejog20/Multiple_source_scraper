@@ -175,7 +175,7 @@ def validate_product_data(product: Dict[str, Any]) -> Dict[str, Any]:
         cleaned["url"] = None
 
     # Copy other fields as-is after basic validation
-    for field in ["source", "currency", "rating", "review_count"]:
+    for field in ["source", "currency", "rating", "review_count", "is_ad"]:
         value = product.get(field)
         if field == "rating" and value is not None:
             try:

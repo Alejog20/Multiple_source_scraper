@@ -95,7 +95,7 @@ class AmazonScraper:
         logger.error(f"[Amazon] Page {page_num}: All strategies FAILED.")
         return []
 
-    async def _fetch_with_httpx(
+    async def _fetch_with_httpx(  # pragma: no cover — live network I/O, see tests/test_amazon_scraper.py
         self, client: httpx.AsyncClient, query: str, page_num: int, is_mobile: bool
     ) -> Optional[str]:
         url = self._get_url(query, page_num, is_mobile)
@@ -124,7 +124,9 @@ class AmazonScraper:
             logger.error(f"[Amazon] HTTPX fetch failed for {url} after retries. Error: {e}")
             return None
 
-    async def _fetch_with_playwright(self, query: str, page_num: int) -> Optional[str]:
+    async def _fetch_with_playwright(  # pragma: no cover — real Playwright browser I/O
+        self, query: str, page_num: int
+    ) -> Optional[str]:
         url = self._get_url(query, page_num, is_mobile=False)
         if (html := self.cache.get(url)) is not None:
             return html
@@ -305,7 +307,7 @@ class AmazonScraper:
                         if price_match:
                             price = float(price_match.group())
                             break
-                    except ValueError:
+                    except ValueError:  # pragma: no cover — regex only matches digits/one dot, always float-parseable
                         continue
 
         if price is None:
@@ -329,7 +331,7 @@ class AmazonScraper:
                     if rating_match:
                         rating = float(rating_match.group(1))
                         break
-                except (ValueError, IndexError):
+                except (ValueError, IndexError):  # pragma: no cover — capture group is always a valid float literal
                     continue
 
         review_selectors = [
