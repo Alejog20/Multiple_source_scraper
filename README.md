@@ -265,7 +265,7 @@ For every page it needs to scrape, each scraper follows this sequence and stops 
 | `bot.py` | Telegram bot. ConversationHandler for `/track` (8 states). Scheduled JobQueue with per-job settings. MarkdownV2 price reports. `/export` command sends job history as an in-memory XLSX document to chat. |
 | `database.py` | SQLAlchemy 2.x async persistence. `TrackedJob` (includes `pages_per_run`, `include_ads`) and `ScrapeHistory` models. Auto-migration via `_apply_migrations`. |
 | `debug_utils.py` | Shared utilities: browser fingerprinting, retry logic, user-agent pools, file cache, data validation, logging infrastructure. **Do not modify.** |
-| `tests/` | Unittest framework for offline validation against static HTML fixtures. |
+| `tests/` | pytest suite for offline validation against inline HTML/JSON fixtures. `core_engine.py`, `debug_utils.py`, `database.py`, `amazon_scraper.py`, `mercadolibre_scraper.py` are held at 100% coverage — see CLAUDE.md's Testing Mandate. |
 | `agent_docs/AGENT_DOCS.md` | AI agent context file — documents architecture, conventions, and current feature state for AI-assisted development sessions. |
 
 ---

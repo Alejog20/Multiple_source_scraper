@@ -15,11 +15,6 @@ Concurrency design — why scrapers run sequentially:
     Playwright fallbacks could fire simultaneously, creating two (or more)
     browser instances in memory at the same time.
 
-    On a typical low-cost VPS (512 MB–1 GB RAM), a single headless Chromium
-    process consumes 150–300 MB. Two concurrent instances can easily trigger
-    OOM (Out-Of-Memory) kills, crashing the entire bot process and losing all
-    in-flight jobs.
-
     The solution has two layers:
     1. **Sequential execution**: scrapers for each platform run one after the
        other inside ``execute_scrape``. This trades 30–60 s of extra wall-clock

@@ -25,3 +25,47 @@ dependencies = [
     "truststore>=0.9.1",
     "curl-cffi>=0.7.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra"
+
+[tool.coverage.run]
+branch = true
+source = [
+    "core_engine",
+    "debug_utils",
+    "database",
+    "amazon_scraper",
+    "mercadolibre_scraper",
+]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    # Optional-dependency import shims (e.g. playwright_stealth, Python<3.8
+    # importlib_metadata backport) — not reachable on this project's pinned
+    # runtime (Python >=3.12, playwright-stealth in pyproject deps) and not
+    # business logic. debug_utils.py is do-not-modify, so this is expressed
+    # here rather than via inline pragmas.
+    "except ImportError:",
+]
+partial_branches = [
+    "pragma: no branch",
+    # retry_with_backoff's for-loop always exits via an explicit `break` on
+    # the final attempt (see the `attempt == max_retries` check) — the
+    # "loop exhausts without breaking" branch is structurally unreachable.
+    "for attempt in range\\(max_retries",
+]

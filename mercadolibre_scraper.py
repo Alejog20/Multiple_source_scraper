@@ -93,7 +93,7 @@ class MercadoLibreScraper:
         logger.error(f"[MercadoLibre] Page {page_num}: All strategies FAILED.")
         return []
 
-    async def _fetch_with_api(
+    async def _fetch_with_api(  # pragma: no cover — live network I/O, see tests/test_mercadolibre_scraper.py
         self, query: str, page_num: int
     ) -> Optional[Dict[str, Any]]:
         offset = (page_num - 1) * 50
@@ -110,7 +110,7 @@ class MercadoLibreScraper:
             logger.error(f"[MercadoLibre] API fetch failed. Error: {e}")
             return None
 
-    async def _fetch_with_curl(
+    async def _fetch_with_curl(  # pragma: no cover — live network I/O, see tests/test_mercadolibre_scraper.py
         self, query: str, page_num: int
     ) -> Optional[str]:
         url = self._get_url(query, page_num)
@@ -132,7 +132,9 @@ class MercadoLibreScraper:
             logger.error(f"[MercadoLibre] curl_cffi HTML fetch failed for {url}. Error: {e}")
             return None
 
-    async def _fetch_with_playwright(self, query: str, page_num: int) -> Optional[str]:
+    async def _fetch_with_playwright(  # pragma: no cover — real Playwright browser I/O
+        self, query: str, page_num: int
+    ) -> Optional[str]:
         url = self._get_url(query, page_num)
         logger.info(f"[MercadoLibre] Playwright navigating to: {url}")
 
@@ -309,7 +311,7 @@ class MercadoLibreScraper:
                 logger.error(f"[MercadoLibre] JSON Decode Error: {e}")
                 save_debug_html(html, "mercadolibre_json_decode_error")
                 return [], False
-            except KeyError as e:
+            except KeyError as e:  # pragma: no cover — navigation above is guarded by `in` checks; defensive only
                 logger.error(f"[MercadoLibre] JSON Key Error: Missing key in structure - {e}")
                 save_debug_html(html, "mercadolibre_json_key_error")
                 return [], False
@@ -466,7 +468,7 @@ class MercadoLibreScraper:
                             elif re.match(r'^[A-Z]{3}\d+$', part): # e.g. MCO123
                                 product_id = part
                                 break
-            except (IndexError, AttributeError):
+            except (IndexError, AttributeError):  # pragma: no cover — url is always a str here; str.split/re never raise these
                 log_html_snippet(logger, "MercadoLibre", "product_id", item.html)
         
         # If product_id is still None, try to get from the parent item's attributes
