@@ -1,0 +1,20 @@
+services:
+  bot:
+    build: .
+    image: multiple-source-scraper-bot:latest
+    container_name: scraper-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever DATABASE_URL is (or isn't) set in .env — the DB
+      # file must live under the bind-mounted /data volume so it survives
+      # `docker compose up -d --build` recreating the container on deploy.
+      DATABASE_URL: sqlite+aiosqlite:////data/scraper_jobs.db
+    volumes:
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
