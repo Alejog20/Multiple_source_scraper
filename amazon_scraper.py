@@ -37,7 +37,7 @@ class AmazonScraper:
     async def search_products(self, query: str, max_pages: int) -> List[Dict[str, Any]]:
         logger.info(f"--- Starting Amazon Search for '{query}' ---")
         async with httpx.AsyncClient(
-            http2=True, timeout=30.0, follow_redirects=True, verify=False
+            http2=True, timeout=30.0, follow_redirects=True
         ) as client:
             all_products = []
             for page_num in range(1, max_pages + 1):

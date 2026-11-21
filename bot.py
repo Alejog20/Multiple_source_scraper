@@ -11,8 +11,15 @@ all persistence lives in database.py. This module owns only:
   - Application startup / shutdown lifecycle
 
 Environment variables (loaded from .env):
-  TELEGRAM_BOT_TOKEN  — required, obtained from BotFather
-  PAGES_PER_SCRAPE    — optional, default 2 (pages passed to execute_scrape)
+  TELEGRAM_BOT_TOKEN       — required, obtained from BotFather
+  ALLOWED_USER_IDS         — required, comma-separated Telegram user IDs; empty = reject everyone
+  ADMIN_USER_ID            — required for admin features (/health, /diag, error alerts)
+  PAGES_PER_SCRAPE         — optional, default 2 (pages passed to execute_scrape)
+  MIN_QUERY_LENGTH         — optional, default 2
+  MAX_QUERY_LENGTH         — optional, default 100
+  MAX_TIMES_PER_JOB        — optional, default 6
+  MAX_ACTIVE_JOBS_PER_USER — optional, default 10
+  MAX_JOB_DURATION_DAYS    — optional, default 90
 """
 
 import asyncio
@@ -55,11 +62,13 @@ from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -129,6 +138,57 @@ _logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 PAGES_PER_SCRAPE: int = int(os.getenv("PAGES_PER_SCRAPE", "2"))
+
+# ---------------------------------------------------------------------------
+# Access control — fail-closed allowlist
+# ---------------------------------------------------------------------------
+# ALLOWED_USER_IDS is the only way in. If it's empty (the out-of-the-box
+# state), every update is rejected and logged at WARNING with the sender's
+# user_id, so the operator can grab their own ID from the log on first
+# contact and add it to the env var. ADMIN_USER_ID is always implicitly
+# allowed even if omitted from ALLOWED_USER_IDS, since admin-only commands
+# (/health, /diag) re-check it independently.
+
+ALLOWED_USER_IDS: frozenset[int] = frozenset(
+    int(uid) for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip()
+)
+ADMIN_USER_ID: int | None = (
+    int(os.environ["ADMIN_USER_ID"]) if os.getenv("ADMIN_USER_ID") else None
+)
+
+# ---------------------------------------------------------------------------
+# Input limits — configurable via env, safe defaults
+# ---------------------------------------------------------------------------
+
+MIN_QUERY_LENGTH: int = int(os.getenv("MIN_QUERY_LENGTH", "2"))
+MAX_QUERY_LENGTH: int = int(os.getenv("MAX_QUERY_LENGTH", "100"))
+MAX_TIMES_PER_JOB: int = int(os.getenv("MAX_TIMES_PER_JOB", "6"))
+"""Cap on the number of HH:MM run-slots a single job may register. Without
+this, a user could request e.g. 24 daily run times, turning one tracking
+job into an hourly-hammering job against Amazon/MercadoLibre."""
+MAX_ACTIVE_JOBS_PER_USER: int = int(os.getenv("MAX_ACTIVE_JOBS_PER_USER", "10"))
+MAX_JOB_DURATION_DAYS: int = int(os.getenv("MAX_JOB_DURATION_DAYS", "90"))
+
+
+def _is_admin(user_id: int | None) -> bool:
+    return user_id is not None and ADMIN_USER_ID is not None and user_id == ADMIN_USER_ID
+
+
+async def _reject_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global gatekeeper — registered in ``group=-1`` so it runs before every
+    other handler (commands, callbacks, ConversationHandler states alike).
+
+    Allowed users pass through silently. Anyone else gets no reply at all —
+    only a WARNING log line with their user_id, which is the intended way
+    for the operator to discover their own ID on first contact.
+    """
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is not None and (user_id in ALLOWED_USER_IDS or _is_admin(user_id)):
+        return
+    _logger.warning("Rejected update from unauthorized user_id=%s", user_id)
+    raise ApplicationHandlerStop
+
 
 # ---------------------------------------------------------------------------
 # ConversationHandler state constants
@@ -404,6 +464,24 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def track_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = str(update.effective_chat.id)
+    async with session_scope() as session:
+        result = await session.execute(
+            select(TrackedJob).where(
+                TrackedJob.chat_id == chat_id,
+                TrackedJob.is_active == True,  # noqa: E712
+            )
+        )
+        active_count = len(result.scalars().all())
+
+    if active_count >= MAX_ACTIVE_JOBS_PER_USER:
+        await update.message.reply_text(
+            f"You already have {active_count} active job(s), which is the "
+            f"maximum ({MAX_ACTIVE_JOBS_PER_USER}). Use /stop to free up a slot "
+            "before creating a new one."
+        )
+        return ConversationHandler.END
+
     context.user_data.clear()
     keyboard = InlineKeyboardMarkup(
         [
@@ -439,7 +517,15 @@ async def platform_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def query_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["query"] = update.message.text.strip()
+    text = update.message.text.strip()
+    if not MIN_QUERY_LENGTH <= len(text) <= MAX_QUERY_LENGTH:
+        await update.message.reply_text(
+            f"Search term must be between {MIN_QUERY_LENGTH} and "
+            f"{MAX_QUERY_LENGTH} characters. Please try again:"
+        )
+        return QUERY
+
+    context.user_data["query"] = text
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -520,6 +606,13 @@ async def times_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return TIMES
         valid_times.append(token)
 
+    if len(valid_times) > MAX_TIMES_PER_JOB:
+        await update.message.reply_text(
+            f"A job can have at most {MAX_TIMES_PER_JOB} run time(s) per day. "
+            f"You entered {len(valid_times)}. Please try again:"
+        )
+        return TIMES
+
     context.user_data["execution_times"] = valid_times
     await update.message.reply_text(
         "How many pages to scrape per run?\n"
@@ -538,6 +631,14 @@ async def pages_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     except ValueError:
         await update.message.reply_text(
             "Please enter a whole number between 0 and 10 (0 = all pages)."
+        )
+        return PAGES
+
+    user_id = update.effective_user.id if update.effective_user else None
+    if pages == 0 and not _is_admin(user_id):
+        await update.message.reply_text(
+            "`0` (all pages) is reserved for the admin. Please enter a number "
+            "between 1 and 10."
         )
         return PAGES
 
@@ -566,7 +667,7 @@ async def ads_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["include_ads"] = (choice == "yes")
 
     await query.edit_message_text(
-        "How many days should this job run before expiring? (1–90):"
+        f"How many days should this job run before expiring? (1–{MAX_JOB_DURATION_DAYS}):"
     )
     return DURATION
 
@@ -577,11 +678,11 @@ async def duration_received(
     text = update.message.text.strip()
     try:
         days = int(text)
-        if not 1 <= days <= 90:
+        if not 1 <= days <= MAX_JOB_DURATION_DAYS:
             raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "Please enter a whole number between 1 and 90."
+            f"Please enter a whole number between 1 and {MAX_JOB_DURATION_DAYS}."
         )
         return DURATION
 
@@ -946,6 +1047,8 @@ def build_application() -> Application:
         .post_init(post_init)
         .build()
     )
+
+    app.add_handler(TypeHandler(Update, _reject_unauthorized), group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))

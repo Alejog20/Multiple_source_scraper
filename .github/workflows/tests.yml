@@ -31,6 +31,31 @@ jobs:
           --cov-report=xml
           -v
 
+      - name: Audit dependencies for known vulnerabilities
+        run: |
+          uv export --format requirements-txt --no-dev > /tmp/requirements.txt
+          uvx pip-audit -r /tmp/requirements.txt --format json > /tmp/audit.json || true
+          python - <<'PY'
+          import json, sys
+
+          with open("/tmp/audit.json") as f:
+              data = json.load(f)
+
+          # Only fail the build for vulnerabilities that have a fix available —
+          # a report-only vuln with no upgrade path isn't actionable in CI.
+          fixable = [
+              (dep["name"], vuln)
+              for dep in data.get("dependencies", [])
+              for vuln in dep.get("vulns", [])
+              if vuln.get("fix_versions")
+          ]
+          if fixable:
+              for name, vuln in fixable:
+                  print(f"::error::{name}: {vuln['id']} — fix available: {vuln['fix_versions']}")
+              sys.exit(1)
+          print("No vulnerabilities with an available fix.")
+          PY
+
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
