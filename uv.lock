@@ -532,6 +532,7 @@ dependencies = [
     { name = "setuptools" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "truststore" },
+    { name = "tzdata" },
     { name = "urllib3" },
 ]
 
@@ -562,6 +563,7 @@ requires-dist = [
     { name = "setuptools", specifier = ">=80.9.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
     { name = "truststore", specifier = ">=0.9.1" },
+    { name = "tzdata", specifier = ">=2025.2" },
     { name = "urllib3", specifier = ">=2.5.0" },
 ]
 

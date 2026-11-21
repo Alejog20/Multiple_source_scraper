@@ -24,6 +24,7 @@ dependencies = [
     "python-telegram-bot[job-queue]>=21.0",
     "truststore>=0.9.1",
     "curl-cffi>=0.7.0",
+    "tzdata>=2025.2",
 ]
 
 [dependency-groups]

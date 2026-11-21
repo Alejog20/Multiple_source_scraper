@@ -194,7 +194,47 @@ class TestInitDbAndMigrations:
                         text("PRAGMA table_info(tracked_jobs)")
                     ).fetchall()
                 }
-            assert {"interval_days", "pages_per_run", "include_ads"} <= columns
+            assert {"interval_days", "pages_per_run", "include_ads", "timezone"} <= columns
+            sync_engine.dispose()
+
+    def test_apply_migrations_defaults_legacy_jobs_to_utc_timezone(self):
+        """Jobs created before the timezone column existed must keep running
+        at the same UTC instant — the migration's DEFAULT 'UTC' is what
+        guarantees that, independent of whatever BOT_TIMEZONE is configured."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            sync_engine = create_engine(f"sqlite:///{tmp_dir}/legacy2.db")
+            with sync_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE tracked_jobs (
+                            id INTEGER PRIMARY KEY,
+                            chat_id TEXT NOT NULL,
+                            query TEXT NOT NULL,
+                            platforms TEXT NOT NULL,
+                            schedule_type TEXT NOT NULL,
+                            execution_times TEXT NOT NULL,
+                            expiration_date TEXT NOT NULL,
+                            is_active BOOLEAN NOT NULL DEFAULT 1,
+                            created_at TEXT
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO tracked_jobs "
+                        "(chat_id, query, platforms, schedule_type, execution_times, expiration_date) "
+                        "VALUES ('1', 'q', '[]', 'daily', '[\"08:00\"]', '2099-01-01')"
+                    )
+                )
+
+            with sync_engine.begin() as conn:
+                database._apply_migrations(conn)
+
+            with sync_engine.connect() as conn:
+                row = conn.execute(text("SELECT timezone FROM tracked_jobs")).fetchone()
+            assert row[0] == "UTC"
             sync_engine.dispose()
 
     def test_apply_migrations_is_a_noop_on_current_schema(self):

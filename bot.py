@@ -31,6 +31,7 @@ import re
 import ssl
 import warnings
 from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # SSL: inject Windows system certificate store into Python's ssl module.
@@ -169,6 +170,16 @@ job into an hourly-hammering job against Amazon/MercadoLibre."""
 MAX_ACTIVE_JOBS_PER_USER: int = int(os.getenv("MAX_ACTIVE_JOBS_PER_USER", "10"))
 MAX_JOB_DURATION_DAYS: int = int(os.getenv("MAX_JOB_DURATION_DAYS", "90"))
 
+# ---------------------------------------------------------------------------
+# Timezone — new jobs are scheduled in BOT_TIMEZONE wall-clock time
+# ---------------------------------------------------------------------------
+# Jobs created before this feature existed keep running in UTC (the
+# `timezone` column defaults to 'UTC' via the database migration) so their
+# behaviour doesn't silently shift when the bot is upgraded. Only new jobs
+# pick up BOT_TIMEZONE.
+
+BOT_TIMEZONE: str = os.getenv("BOT_TIMEZONE", "America/Bogota")
+
 
 def _is_admin(user_id: int | None) -> bool:
     return user_id is not None and ADMIN_USER_ID is not None and user_id == ADMIN_USER_ID
@@ -272,7 +283,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["<b>Active tracking jobs:</b>\n"]
     for job in jobs:
         platforms_str = ", ".join(p.capitalize() for p in job.get_platforms())
-        times_str = ", ".join(job.get_execution_times())
+        times_str = ", ".join(job.get_execution_times()) + f" ({job.timezone})"
         expiry_str = job.expiration_date.strftime("%Y-%m-%d")
         lines.append(
             f"<code>#{job.id}</code> | {html.escape(job.query[:30])} | "
@@ -558,7 +569,7 @@ async def frequency_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return INTERVAL_DAYS
 
     await query.edit_message_text(
-        "Enter run time(s) in HH:MM format (UTC), separated by commas.\n"
+        f"Enter run time(s) in HH:MM format ({BOT_TIMEZONE}), separated by commas.\n"
         "Examples: 08:00  or  08:00, 20:00"
     )
     return TIMES
@@ -580,7 +591,7 @@ async def interval_days_received(
 
     context.user_data["interval_days"] = days
     await update.message.reply_text(
-        "Enter run time(s) in HH:MM format (UTC), separated by commas.\n"
+        f"Enter run time(s) in HH:MM format ({BOT_TIMEZONE}), separated by commas.\n"
         "Examples: 08:00  or  08:00, 20:00"
     )
     return TIMES
@@ -701,6 +712,7 @@ async def duration_received(
             interval_days=ud.get("interval_days"),
             pages_per_run=ud.get("pages_per_run", 2),
             include_ads=ud.get("include_ads", True),
+            timezone=BOT_TIMEZONE,
         )
         session.add(job)
         await session.flush()  # populate job.id before commit
@@ -716,7 +728,7 @@ async def duration_received(
 
     first_time = ud["execution_times"][0]
     await update.message.reply_text(
-        f"Job #{job_id} deployed. First run at {first_time} UTC.",
+        f"Job #{job_id} deployed. First run at {first_time} {BOT_TIMEZONE}.",
         reply_markup=ReplyKeyboardRemove(),
     )
     context.user_data.clear()
@@ -931,9 +943,11 @@ def _register_job_in_scheduler(application: Application, job: TrackedJob) -> Non
         "include_ads": job.include_ads,
     }
 
+    job_tz = ZoneInfo(job.timezone)
+
     for time_str in job.get_execution_times():
         hour, minute = map(int, time_str.split(":"))
-        run_time = time(hour, minute, tzinfo=timezone.utc)
+        run_time = time(hour, minute, tzinfo=job_tz)
 
         if job.schedule_type == "daily":
             application.job_queue.run_daily(
