@@ -2,7 +2,13 @@ name: Tests
 
 on:
   pull_request:
+  push:
+    branches: [master]
   workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -26,6 +32,7 @@ jobs:
       - name: Run pytest with coverage
         run: >
           uv run pytest
+          -m "not live"
           --cov
           --cov-report=term-missing
           --cov-report=xml
