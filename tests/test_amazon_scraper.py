@@ -384,3 +384,15 @@ class TestFetchWithHttpxSmoke:
         result = await scraper._fetch_with_httpx(fake_client, "q", 1, is_mobile=False)
         assert result == "<html>cached</html>"
         fake_client.get.assert_not_called()
+
+
+class TestPlaywrightStealthDependency:
+    """playwright-stealth is a real pyproject.toml dependency (not just an
+    optional try/except shim) — if it's ever accidentally removed from
+    dependencies again, this import-time check fails loudly instead of
+    silently disabling stealth in production."""
+
+    def test_stealth_async_is_available(self):
+        from amazon_scraper import stealth_async
+
+        assert stealth_async is not None

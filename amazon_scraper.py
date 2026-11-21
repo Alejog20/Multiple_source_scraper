@@ -28,6 +28,14 @@ from debug_utils import (
 
 logger = logging.getLogger(__name__)
 
+if stealth_async is not None:
+    logger.info("[Amazon] playwright-stealth is ACTIVE for the Playwright fallback.")
+else:  # pragma: no cover — playwright-stealth is a pinned dependency; see pyproject.toml
+    logger.warning(
+        "[Amazon] playwright-stealth is NOT installed — falling back to the "
+        "minimal inline stealth script. CAPTCHA/bot-detection risk is higher."
+    )
+
 
 class AmazonScraper:
     def __init__(self) -> None:

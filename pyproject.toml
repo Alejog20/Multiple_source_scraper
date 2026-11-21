@@ -25,6 +25,7 @@ dependencies = [
     "truststore>=0.9.1",
     "curl-cffi>=0.7.0",
     "tzdata>=2025.2",
+    "playwright-stealth>=1.0.6,<2",
 ]
 
 [dependency-groups]
