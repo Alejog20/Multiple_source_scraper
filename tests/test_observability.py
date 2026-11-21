@@ -222,5 +222,21 @@ class TestHeartbeat(unittest.IsolatedAsyncioTestCase):
             await bot_module._heartbeat_task(MagicMock())  # must not raise
 
 
+class TestHealthFileTouch(unittest.IsolatedAsyncioTestCase):
+    async def test_touches_configured_health_file(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            health_file = str(Path(tmp_dir) / "healthy")
+            with patch.object(bot_module, "HEALTH_FILE", health_file):
+                await bot_module._touch_health_file(MagicMock())
+            self.assertTrue(Path(health_file).exists())
+
+    async def test_touch_failure_is_logged_not_raised(self):
+        with patch.object(bot_module, "HEALTH_FILE", "/nonexistent-dir/healthy"):
+            await bot_module._touch_health_file(MagicMock())  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

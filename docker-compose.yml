@@ -1,6 +1,9 @@
 services:
   bot:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     image: multiple-source-scraper-bot:latest
     container_name: scraper-bot
     restart: unless-stopped
@@ -13,6 +16,29 @@ services:
       DATABASE_URL: sqlite+aiosqlite:////data/scraper_jobs.db
     volumes:
       - ./data:/data
+    # The bind-mounted ./data volume must be writable by the container's
+    # non-root user (UID 10001). On the host, before first run:
+    #   sudo chown -R 10001:10001 data
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1500m
+    pids_limit: 512
+    # init: true runs a tiny init (tini) as PID 1 so it reaps zombie
+    # processes — Chromium forks helper processes on every page load and
+    # Playwright doesn't always wait() them itself.
+    init: true
+    # Chromium crashes under the default 64MB /dev/shm; Playwright's own
+    # docs recommend at least this much for a single headless instance.
+    shm_size: 256m
+    healthcheck:
+      # bot.py touches HEALTH_FILE (default /tmp/bot_healthy) every 5
+      # minutes via the JobQueue, independent of user/job activity — a
+      # frozen event loop stops updating it even during idle periods.
+      test: ["CMD-SHELL", "find /tmp/bot_healthy -mmin -10 2>/dev/null | grep -q . || exit 1"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     logging:
       driver: json-file
       options:

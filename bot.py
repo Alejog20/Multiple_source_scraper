@@ -31,6 +31,7 @@ import re
 import ssl
 import warnings
 from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
@@ -188,6 +189,13 @@ BOT_TIMEZONE: str = os.getenv("BOT_TIMEZONE", "America/Bogota")
 GIT_SHA: str = os.getenv("GIT_SHA", "unknown")
 HEARTBEAT_URL: str | None = os.getenv("HEARTBEAT_URL") or None
 _START_TIME: datetime = datetime.now(tz=timezone.utc)
+
+HEALTH_FILE: str = os.getenv("HEALTH_FILE", "/tmp/bot_healthy")
+"""Sentinel file touched every few minutes by _touch_health_file, used by
+Docker's HEALTHCHECK. Deliberately independent of HEARTBEAT_URL and of user
+activity — a frozen event loop stops touching it even if no job or heartbeat
+is configured, which a log-mtime-based healthcheck could miss during
+legitimately idle periods."""
 
 
 def _is_admin(user_id: int | None) -> bool:
@@ -1124,6 +1132,16 @@ async def _heartbeat_task(context: ContextTypes.DEFAULT_TYPE) -> None:
         _logger.warning("Heartbeat GET to HEARTBEAT_URL failed: %s", exc)
 
 
+async def _touch_health_file(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Updates HEALTH_FILE's mtime so Docker's HEALTHCHECK can detect a
+    frozen event loop. Registered unconditionally (unlike the HEARTBEAT_URL
+    ping) so the container healthcheck works out of the box."""
+    try:
+        Path(HEALTH_FILE).touch()
+    except OSError as exc:
+        _logger.warning("Could not touch HEALTH_FILE %s: %s", HEALTH_FILE, exc)
+
+
 # ---------------------------------------------------------------------------
 # Startup hooks
 # ---------------------------------------------------------------------------
@@ -1168,6 +1186,10 @@ async def post_init(application: Application) -> None:
 
     _logger.info("Recovering scheduled jobs from database…")
     await _restore_jobs_from_db(application)
+
+    application.job_queue.run_repeating(
+        _touch_health_file, interval=timedelta(minutes=5), first=0, name="health_touch"
+    )
 
     if HEARTBEAT_URL:
         application.job_queue.run_repeating(
