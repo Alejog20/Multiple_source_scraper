@@ -45,12 +45,13 @@ try:
 except ImportError:
     pass  # truststore not installed; fall back to default SSL behaviour
 
+import httpx
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.text import Text
-from sqlalchemy import select
+from sqlalchemy import func, select
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -180,6 +181,14 @@ MAX_JOB_DURATION_DAYS: int = int(os.getenv("MAX_JOB_DURATION_DAYS", "90"))
 
 BOT_TIMEZONE: str = os.getenv("BOT_TIMEZONE", "America/Bogota")
 
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+
+GIT_SHA: str = os.getenv("GIT_SHA", "unknown")
+HEARTBEAT_URL: str | None = os.getenv("HEARTBEAT_URL") or None
+_START_TIME: datetime = datetime.now(tz=timezone.utc)
+
 
 def _is_admin(user_id: int | None) -> bool:
     return user_id is not None and ADMIN_USER_ID is not None and user_id == ADMIN_USER_ID
@@ -256,6 +265,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/list   – View your active jobs\n"
         "/stop   – Cancel a running job\n"
         "/export – Download history for a job as an Excel file\n"
+        "/runnow – Run one of your jobs immediately\n"
+        "/health – Admin: operational status snapshot\n"
         "/help   – Show this message"
     )
 
@@ -923,6 +934,18 @@ async def scheduled_scrape_task(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_job_data(job: TrackedJob) -> dict:
+    """Build the JobQueue ``data`` payload shared by scheduled runs and
+    ``/runnow`` — keeps both call sites in sync on what ``scheduled_scrape_task``
+    expects to find in ``context.job.data``."""
+    return {
+        "job_id": job.id,
+        "chat_id": job.chat_id,
+        "pages_per_run": job.pages_per_run,
+        "include_ads": job.include_ads,
+    }
+
+
 def _register_job_in_scheduler(application: Application, job: TrackedJob) -> None:
     """Add a TrackedJob's run-times to the application's JobQueue.
 
@@ -936,12 +959,7 @@ def _register_job_in_scheduler(application: Application, job: TrackedJob) -> Non
             already committed and accessible (``expire_on_commit=False``).
     """
     job_name = f"job_{job.id}"
-    job_data = {
-        "job_id": job.id,
-        "chat_id": job.chat_id,
-        "pages_per_run": job.pages_per_run,
-        "include_ads": job.include_ads,
-    }
+    job_data = _build_job_data(job)
 
     job_tz = ZoneInfo(job.timezone)
 
@@ -991,6 +1009,122 @@ def _register_job_in_scheduler(application: Application, job: TrackedJob) -> Non
 
 
 # ---------------------------------------------------------------------------
+# Observability — error handler, /runnow, /health, heartbeat
+# ---------------------------------------------------------------------------
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler registered via ``Application.add_error_handler``.
+
+    The full traceback always goes to the log (that's what post-mortems use).
+    The admin additionally gets a short, truncated Telegram message with just
+    enough to triage — exception type, originating job (if any), and the
+    error text — never the traceback itself, which could leak internals.
+    """
+    _logger.error("Exception while handling an update: %s", update, exc_info=context.error)
+
+    if ADMIN_USER_ID is None:
+        return
+
+    job_id = None
+    if context.job is not None and isinstance(context.job.data, dict):
+        job_id = context.job.data.get("job_id")
+
+    parts = [f"⚠️ {type(context.error).__name__}"]
+    if job_id is not None:
+        parts.append(f"job #{job_id}")
+    summary = " | ".join(parts) + f": {context.error}"
+    summary = summary[:1000]
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_USER_ID, text=summary)
+    except Exception as exc:
+        _logger.warning("Could not notify admin of error: %s", exc)
+
+
+async def cmd_runnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run one of the caller's own jobs immediately, without waiting for its
+    scheduled time. Useful for testing a job from the phone right after
+    creating it."""
+    chat_id = str(update.effective_chat.id)
+    args = context.args
+
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /runnow <job_id>")
+        return
+
+    job_id = int(args[0])
+    async with session_scope() as session:
+        result = await session.execute(select(TrackedJob).where(TrackedJob.id == job_id))
+        job = result.scalar_one_or_none()
+
+    if job is None or job.chat_id != chat_id:
+        await update.message.reply_text("Job not found or access denied.")
+        return
+
+    context.job_queue.run_once(
+        scheduled_scrape_task,
+        when=0,
+        data=_build_job_data(job),
+        name=f"runnow_job_{job.id}",
+        chat_id=int(job.chat_id),
+    )
+    await update.message.reply_text(f"Running job #{job_id} now…")
+
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only operational snapshot — uptime, active jobs, last
+    successful scrape, build version, and outbound IP (useful to confirm
+    which network the bot is actually scraping from)."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _is_admin(user_id):
+        await update.message.reply_text("Admin only.")
+        return
+
+    uptime = datetime.now(tz=timezone.utc) - _START_TIME
+
+    async with session_scope() as session:
+        active_result = await session.execute(
+            select(func.count()).select_from(TrackedJob).where(
+                TrackedJob.is_active == True  # noqa: E712
+            )
+        )
+        active_count = active_result.scalar_one()
+
+        last_scrape_result = await session.execute(select(func.max(ScrapeHistory.timestamp)))
+        last_scrape = last_scrape_result.scalar_one()
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get("https://checkip.amazonaws.com")
+            public_ip = response.text.strip()
+    except Exception as exc:
+        _logger.warning("cmd_health: could not determine outbound IP: %s", exc)
+        public_ip = "unknown"
+
+    await update.message.reply_text(
+        "🩺 *Health*\n"
+        f"Uptime: {_esc(str(uptime).split('.')[0])}\n"
+        f"Active jobs: {_esc(str(active_count))}\n"
+        f"Last successful scrape: {_esc(str(last_scrape) if last_scrape else 'never')}\n"
+        f"Version: {_esc(GIT_SHA)}\n"
+        f"Outbound IP: {_esc(public_ip)}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def _heartbeat_task(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pings an external dead-man's-switch (e.g. healthchecks.io) so the
+    operator is alerted by that service if the bot process dies — it stops
+    checking in, rather than the bot having to detect its own death."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.get(HEARTBEAT_URL)
+    except Exception as exc:
+        _logger.warning("Heartbeat GET to HEARTBEAT_URL failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Startup hooks
 # ---------------------------------------------------------------------------
 
@@ -1035,6 +1169,12 @@ async def post_init(application: Application) -> None:
     _logger.info("Recovering scheduled jobs from database…")
     await _restore_jobs_from_db(application)
 
+    if HEARTBEAT_URL:
+        application.job_queue.run_repeating(
+            _heartbeat_task, interval=timedelta(minutes=10), first=0, name="heartbeat"
+        )
+        _logger.info("[green]Heartbeat enabled[/green] — pinging HEARTBEAT_URL every 10 min")
+
     await application.bot.set_my_commands(
         [
             BotCommand("start", "Initialize the web scraping engine"),
@@ -1042,6 +1182,8 @@ async def post_init(application: Application) -> None:
             BotCommand("list", "Fetch all active database records"),
             BotCommand("stop", "Terminate a running scheduled job"),
             BotCommand("export", "Download scrape history as Excel"),
+            BotCommand("runnow", "Run one of your jobs immediately"),
+            BotCommand("health", "Admin: operational status snapshot"),
             BotCommand("help", "Access documentation and syntax guide"),
         ]
     )
@@ -1071,7 +1213,11 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(stop_callback, pattern=r"^stop:\d+$"))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CallbackQueryHandler(export_callback, pattern=r"^export:\d+$"))
+    app.add_handler(CommandHandler("runnow", cmd_runnow))
+    app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(build_track_conversation())
+
+    app.add_error_handler(error_handler)
 
     return app
 
