@@ -11,8 +11,15 @@ all persistence lives in database.py. This module owns only:
   - Application startup / shutdown lifecycle
 
 Environment variables (loaded from .env):
-  TELEGRAM_BOT_TOKEN  — required, obtained from BotFather
-  PAGES_PER_SCRAPE    — optional, default 2 (pages passed to execute_scrape)
+  TELEGRAM_BOT_TOKEN       — required, obtained from BotFather
+  ALLOWED_USER_IDS         — required, comma-separated Telegram user IDs; empty = reject everyone
+  ADMIN_USER_ID            — required for admin features (/health, /diag, error alerts)
+  PAGES_PER_SCRAPE         — optional, default 2 (pages passed to execute_scrape)
+  MIN_QUERY_LENGTH         — optional, default 2
+  MAX_QUERY_LENGTH         — optional, default 100
+  MAX_TIMES_PER_JOB        — optional, default 6
+  MAX_ACTIVE_JOBS_PER_USER — optional, default 10
+  MAX_JOB_DURATION_DAYS    — optional, default 90
 """
 
 import asyncio
@@ -24,6 +31,8 @@ import re
 import ssl
 import warnings
 from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # SSL: inject Windows system certificate store into Python's ssl module.
@@ -37,12 +46,13 @@ try:
 except ImportError:
     pass  # truststore not installed; fall back to default SSL behaviour
 
+import httpx
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.text import Text
-from sqlalchemy import select
+from sqlalchemy import func, select
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -55,11 +65,13 @@ from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -131,6 +143,82 @@ TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 PAGES_PER_SCRAPE: int = int(os.getenv("PAGES_PER_SCRAPE", "2"))
 
 # ---------------------------------------------------------------------------
+# Access control — fail-closed allowlist
+# ---------------------------------------------------------------------------
+# ALLOWED_USER_IDS is the only way in. If it's empty (the out-of-the-box
+# state), every update is rejected and logged at WARNING with the sender's
+# user_id, so the operator can grab their own ID from the log on first
+# contact and add it to the env var. ADMIN_USER_ID is always implicitly
+# allowed even if omitted from ALLOWED_USER_IDS, since admin-only commands
+# (/health, /diag) re-check it independently.
+
+ALLOWED_USER_IDS: frozenset[int] = frozenset(
+    int(uid) for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip()
+)
+ADMIN_USER_ID: int | None = (
+    int(os.environ["ADMIN_USER_ID"]) if os.getenv("ADMIN_USER_ID") else None
+)
+
+# ---------------------------------------------------------------------------
+# Input limits — configurable via env, safe defaults
+# ---------------------------------------------------------------------------
+
+MIN_QUERY_LENGTH: int = int(os.getenv("MIN_QUERY_LENGTH", "2"))
+MAX_QUERY_LENGTH: int = int(os.getenv("MAX_QUERY_LENGTH", "100"))
+MAX_TIMES_PER_JOB: int = int(os.getenv("MAX_TIMES_PER_JOB", "6"))
+"""Cap on the number of HH:MM run-slots a single job may register. Without
+this, a user could request e.g. 24 daily run times, turning one tracking
+job into an hourly-hammering job against Amazon/MercadoLibre."""
+MAX_ACTIVE_JOBS_PER_USER: int = int(os.getenv("MAX_ACTIVE_JOBS_PER_USER", "10"))
+MAX_JOB_DURATION_DAYS: int = int(os.getenv("MAX_JOB_DURATION_DAYS", "90"))
+
+# ---------------------------------------------------------------------------
+# Timezone — new jobs are scheduled in BOT_TIMEZONE wall-clock time
+# ---------------------------------------------------------------------------
+# Jobs created before this feature existed keep running in UTC (the
+# `timezone` column defaults to 'UTC' via the database migration) so their
+# behaviour doesn't silently shift when the bot is upgraded. Only new jobs
+# pick up BOT_TIMEZONE.
+
+BOT_TIMEZONE: str = os.getenv("BOT_TIMEZONE", "America/Bogota")
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+
+GIT_SHA: str = os.getenv("GIT_SHA", "unknown")
+HEARTBEAT_URL: str | None = os.getenv("HEARTBEAT_URL") or None
+_START_TIME: datetime = datetime.now(tz=timezone.utc)
+
+HEALTH_FILE: str = os.getenv("HEALTH_FILE", "/tmp/bot_healthy")
+"""Sentinel file touched every few minutes by _touch_health_file, used by
+Docker's HEALTHCHECK. Deliberately independent of HEARTBEAT_URL and of user
+activity — a frozen event loop stops touching it even if no job or heartbeat
+is configured, which a log-mtime-based healthcheck could miss during
+legitimately idle periods."""
+
+
+def _is_admin(user_id: int | None) -> bool:
+    return user_id is not None and ADMIN_USER_ID is not None and user_id == ADMIN_USER_ID
+
+
+async def _reject_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global gatekeeper — registered in ``group=-1`` so it runs before every
+    other handler (commands, callbacks, ConversationHandler states alike).
+
+    Allowed users pass through silently. Anyone else gets no reply at all —
+    only a WARNING log line with their user_id, which is the intended way
+    for the operator to discover their own ID on first contact.
+    """
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is not None and (user_id in ALLOWED_USER_IDS or _is_admin(user_id)):
+        return
+    _logger.warning("Rejected update from unauthorized user_id=%s", user_id)
+    raise ApplicationHandlerStop
+
+
+# ---------------------------------------------------------------------------
 # ConversationHandler state constants
 # ---------------------------------------------------------------------------
 
@@ -185,6 +273,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/list   – View your active jobs\n"
         "/stop   – Cancel a running job\n"
         "/export – Download history for a job as an Excel file\n"
+        "/runnow – Run one of your jobs immediately\n"
+        "/health – Admin: operational status snapshot\n"
+        "/diag   – Admin: probe Amazon access from this host\n"
         "/help   – Show this message"
     )
 
@@ -212,7 +303,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["<b>Active tracking jobs:</b>\n"]
     for job in jobs:
         platforms_str = ", ".join(p.capitalize() for p in job.get_platforms())
-        times_str = ", ".join(job.get_execution_times())
+        times_str = ", ".join(job.get_execution_times()) + f" ({job.timezone})"
         expiry_str = job.expiration_date.strftime("%Y-%m-%d")
         lines.append(
             f"<code>#{job.id}</code> | {html.escape(job.query[:30])} | "
@@ -404,6 +495,24 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def track_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = str(update.effective_chat.id)
+    async with session_scope() as session:
+        result = await session.execute(
+            select(TrackedJob).where(
+                TrackedJob.chat_id == chat_id,
+                TrackedJob.is_active == True,  # noqa: E712
+            )
+        )
+        active_count = len(result.scalars().all())
+
+    if active_count >= MAX_ACTIVE_JOBS_PER_USER:
+        await update.message.reply_text(
+            f"You already have {active_count} active job(s), which is the "
+            f"maximum ({MAX_ACTIVE_JOBS_PER_USER}). Use /stop to free up a slot "
+            "before creating a new one."
+        )
+        return ConversationHandler.END
+
     context.user_data.clear()
     keyboard = InlineKeyboardMarkup(
         [
@@ -439,7 +548,15 @@ async def platform_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def query_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["query"] = update.message.text.strip()
+    text = update.message.text.strip()
+    if not MIN_QUERY_LENGTH <= len(text) <= MAX_QUERY_LENGTH:
+        await update.message.reply_text(
+            f"Search term must be between {MIN_QUERY_LENGTH} and "
+            f"{MAX_QUERY_LENGTH} characters. Please try again:"
+        )
+        return QUERY
+
+    context.user_data["query"] = text
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -472,7 +589,7 @@ async def frequency_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return INTERVAL_DAYS
 
     await query.edit_message_text(
-        "Enter run time(s) in HH:MM format (UTC), separated by commas.\n"
+        f"Enter run time(s) in HH:MM format ({BOT_TIMEZONE}), separated by commas.\n"
         "Examples: 08:00  or  08:00, 20:00"
     )
     return TIMES
@@ -494,7 +611,7 @@ async def interval_days_received(
 
     context.user_data["interval_days"] = days
     await update.message.reply_text(
-        "Enter run time(s) in HH:MM format (UTC), separated by commas.\n"
+        f"Enter run time(s) in HH:MM format ({BOT_TIMEZONE}), separated by commas.\n"
         "Examples: 08:00  or  08:00, 20:00"
     )
     return TIMES
@@ -520,6 +637,13 @@ async def times_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return TIMES
         valid_times.append(token)
 
+    if len(valid_times) > MAX_TIMES_PER_JOB:
+        await update.message.reply_text(
+            f"A job can have at most {MAX_TIMES_PER_JOB} run time(s) per day. "
+            f"You entered {len(valid_times)}. Please try again:"
+        )
+        return TIMES
+
     context.user_data["execution_times"] = valid_times
     await update.message.reply_text(
         "How many pages to scrape per run?\n"
@@ -538,6 +662,14 @@ async def pages_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     except ValueError:
         await update.message.reply_text(
             "Please enter a whole number between 0 and 10 (0 = all pages)."
+        )
+        return PAGES
+
+    user_id = update.effective_user.id if update.effective_user else None
+    if pages == 0 and not _is_admin(user_id):
+        await update.message.reply_text(
+            "`0` (all pages) is reserved for the admin. Please enter a number "
+            "between 1 and 10."
         )
         return PAGES
 
@@ -566,7 +698,7 @@ async def ads_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["include_ads"] = (choice == "yes")
 
     await query.edit_message_text(
-        "How many days should this job run before expiring? (1–90):"
+        f"How many days should this job run before expiring? (1–{MAX_JOB_DURATION_DAYS}):"
     )
     return DURATION
 
@@ -577,11 +709,11 @@ async def duration_received(
     text = update.message.text.strip()
     try:
         days = int(text)
-        if not 1 <= days <= 90:
+        if not 1 <= days <= MAX_JOB_DURATION_DAYS:
             raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "Please enter a whole number between 1 and 90."
+            f"Please enter a whole number between 1 and {MAX_JOB_DURATION_DAYS}."
         )
         return DURATION
 
@@ -600,6 +732,7 @@ async def duration_received(
             interval_days=ud.get("interval_days"),
             pages_per_run=ud.get("pages_per_run", 2),
             include_ads=ud.get("include_ads", True),
+            timezone=BOT_TIMEZONE,
         )
         session.add(job)
         await session.flush()  # populate job.id before commit
@@ -615,7 +748,7 @@ async def duration_received(
 
     first_time = ud["execution_times"][0]
     await update.message.reply_text(
-        f"Job #{job_id} deployed. First run at {first_time} UTC.",
+        f"Job #{job_id} deployed. First run at {first_time} {BOT_TIMEZONE}.",
         reply_markup=ReplyKeyboardRemove(),
     )
     context.user_data.clear()
@@ -810,6 +943,18 @@ async def scheduled_scrape_task(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_job_data(job: TrackedJob) -> dict:
+    """Build the JobQueue ``data`` payload shared by scheduled runs and
+    ``/runnow`` — keeps both call sites in sync on what ``scheduled_scrape_task``
+    expects to find in ``context.job.data``."""
+    return {
+        "job_id": job.id,
+        "chat_id": job.chat_id,
+        "pages_per_run": job.pages_per_run,
+        "include_ads": job.include_ads,
+    }
+
+
 def _register_job_in_scheduler(application: Application, job: TrackedJob) -> None:
     """Add a TrackedJob's run-times to the application's JobQueue.
 
@@ -823,16 +968,13 @@ def _register_job_in_scheduler(application: Application, job: TrackedJob) -> Non
             already committed and accessible (``expire_on_commit=False``).
     """
     job_name = f"job_{job.id}"
-    job_data = {
-        "job_id": job.id,
-        "chat_id": job.chat_id,
-        "pages_per_run": job.pages_per_run,
-        "include_ads": job.include_ads,
-    }
+    job_data = _build_job_data(job)
+
+    job_tz = ZoneInfo(job.timezone)
 
     for time_str in job.get_execution_times():
         hour, minute = map(int, time_str.split(":"))
-        run_time = time(hour, minute, tzinfo=timezone.utc)
+        run_time = time(hour, minute, tzinfo=job_tz)
 
         if job.schedule_type == "daily":
             application.job_queue.run_daily(
@@ -873,6 +1015,176 @@ def _register_job_in_scheduler(application: Application, job: TrackedJob) -> Non
                 job.schedule_type,
                 job.id,
             )
+
+
+# ---------------------------------------------------------------------------
+# Observability — error handler, /runnow, /health, heartbeat
+# ---------------------------------------------------------------------------
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler registered via ``Application.add_error_handler``.
+
+    The full traceback always goes to the log (that's what post-mortems use).
+    The admin additionally gets a short, truncated Telegram message with just
+    enough to triage — exception type, originating job (if any), and the
+    error text — never the traceback itself, which could leak internals.
+    """
+    _logger.error("Exception while handling an update: %s", update, exc_info=context.error)
+
+    if ADMIN_USER_ID is None:
+        return
+
+    job_id = None
+    if context.job is not None and isinstance(context.job.data, dict):
+        job_id = context.job.data.get("job_id")
+
+    parts = [f"⚠️ {type(context.error).__name__}"]
+    if job_id is not None:
+        parts.append(f"job #{job_id}")
+    summary = " | ".join(parts) + f": {context.error}"
+    summary = summary[:1000]
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_USER_ID, text=summary)
+    except Exception as exc:
+        _logger.warning("Could not notify admin of error: %s", exc)
+
+
+async def cmd_runnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run one of the caller's own jobs immediately, without waiting for its
+    scheduled time. Useful for testing a job from the phone right after
+    creating it."""
+    chat_id = str(update.effective_chat.id)
+    args = context.args
+
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /runnow <job_id>")
+        return
+
+    job_id = int(args[0])
+    async with session_scope() as session:
+        result = await session.execute(select(TrackedJob).where(TrackedJob.id == job_id))
+        job = result.scalar_one_or_none()
+
+    if job is None or job.chat_id != chat_id:
+        await update.message.reply_text("Job not found or access denied.")
+        return
+
+    context.job_queue.run_once(
+        scheduled_scrape_task,
+        when=0,
+        data=_build_job_data(job),
+        name=f"runnow_job_{job.id}",
+        chat_id=int(job.chat_id),
+    )
+    await update.message.reply_text(f"Running job #{job_id} now…")
+
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only operational snapshot — uptime, active jobs, last
+    successful scrape, build version, and outbound IP (useful to confirm
+    which network the bot is actually scraping from)."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _is_admin(user_id):
+        await update.message.reply_text("Admin only.")
+        return
+
+    uptime = datetime.now(tz=timezone.utc) - _START_TIME
+
+    async with session_scope() as session:
+        active_result = await session.execute(
+            select(func.count()).select_from(TrackedJob).where(
+                TrackedJob.is_active == True  # noqa: E712
+            )
+        )
+        active_count = active_result.scalar_one()
+
+        last_scrape_result = await session.execute(select(func.max(ScrapeHistory.timestamp)))
+        last_scrape = last_scrape_result.scalar_one()
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get("https://checkip.amazonaws.com")
+            public_ip = response.text.strip()
+    except Exception as exc:
+        _logger.warning("cmd_health: could not determine outbound IP: %s", exc)
+        public_ip = "unknown"
+
+    await update.message.reply_text(
+        "🩺 *Health*\n"
+        f"Uptime: {_esc(str(uptime).split('.')[0])}\n"
+        f"Active jobs: {_esc(str(active_count))}\n"
+        f"Last successful scrape: {_esc(str(last_scrape) if last_scrape else 'never')}\n"
+        f"Version: {_esc(GIT_SHA)}\n"
+        f"Outbound IP: {_esc(public_ip)}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def _heartbeat_task(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pings an external dead-man's-switch (e.g. healthchecks.io) so the
+    operator is alerted by that service if the bot process dies — it stops
+    checking in, rather than the bot having to detect its own death."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.get(HEARTBEAT_URL)
+    except Exception as exc:
+        _logger.warning("Heartbeat GET to HEARTBEAT_URL failed: %s", exc)
+
+
+async def _touch_health_file(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Updates HEALTH_FILE's mtime so Docker's HEALTHCHECK can detect a
+    frozen event loop. Registered unconditionally (unlike the HEARTBEAT_URL
+    ping) so the container healthcheck works out of the box."""
+    try:
+        Path(HEALTH_FILE).touch()
+    except OSError as exc:
+        _logger.warning("Could not touch HEALTH_FILE %s: %s", HEALTH_FILE, exc)
+
+
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: runs a minimal (1 query, 1 round) version of
+    scripts/probe_amazon.py in the background and reports a per-strategy
+    ✅/⚠️/❌ summary. Shares core_engine's _browser_semaphore so this never
+    races a scheduled job's own Playwright instance."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _is_admin(user_id):
+        await update.message.reply_text("Admin only.")
+        return
+
+    await update.message.reply_text("Running diagnostics — this can take a minute…")
+    chat_id = update.effective_chat.id
+    asyncio.create_task(_run_diag_and_report(context, chat_id))
+
+
+async def _run_diag_and_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    from amazon_scraper import AmazonScraper
+    from core_engine import _browser_semaphore
+    from scripts.probe_amazon import ALL_STRATEGIES, get_public_ip, run_attempt
+
+    try:
+        public_ip = await get_public_ip()
+        parser_helper = AmazonScraper()
+        lines = [f"Outbound IP: {public_ip}"]
+
+        async with _browser_semaphore:
+            for strategy in ALL_STRATEGIES:
+                attempt = await run_attempt(strategy, "kindle paperwhite", page=1, parser=parser_helper)
+                if attempt.error:
+                    lines.append(f"❌ {strategy}: {attempt.error}")
+                elif attempt.block_reason:
+                    lines.append(f"⚠️ {strategy}: {attempt.block_reason}")
+                else:
+                    lines.append(f"✅ {strategy}: {attempt.products_found} product(s)")
+
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    except Exception as exc:
+        _logger.error("cmd_diag: probe run failed: %s", exc)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"Diagnostics failed: {exc}")
+        except Exception as send_exc:
+            _logger.warning("cmd_diag: could not report failure to chat: %s", send_exc)
 
 
 # ---------------------------------------------------------------------------
@@ -920,6 +1232,16 @@ async def post_init(application: Application) -> None:
     _logger.info("Recovering scheduled jobs from database…")
     await _restore_jobs_from_db(application)
 
+    application.job_queue.run_repeating(
+        _touch_health_file, interval=timedelta(minutes=5), first=0, name="health_touch"
+    )
+
+    if HEARTBEAT_URL:
+        application.job_queue.run_repeating(
+            _heartbeat_task, interval=timedelta(minutes=10), first=0, name="heartbeat"
+        )
+        _logger.info("[green]Heartbeat enabled[/green] — pinging HEARTBEAT_URL every 10 min")
+
     await application.bot.set_my_commands(
         [
             BotCommand("start", "Initialize the web scraping engine"),
@@ -927,6 +1249,9 @@ async def post_init(application: Application) -> None:
             BotCommand("list", "Fetch all active database records"),
             BotCommand("stop", "Terminate a running scheduled job"),
             BotCommand("export", "Download scrape history as Excel"),
+            BotCommand("runnow", "Run one of your jobs immediately"),
+            BotCommand("health", "Admin: operational status snapshot"),
+            BotCommand("diag", "Admin: probe Amazon access from this host"),
             BotCommand("help", "Access documentation and syntax guide"),
         ]
     )
@@ -947,6 +1272,8 @@ def build_application() -> Application:
         .build()
     )
 
+    app.add_handler(TypeHandler(Update, _reject_unauthorized), group=-1)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
@@ -954,7 +1281,12 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(stop_callback, pattern=r"^stop:\d+$"))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CallbackQueryHandler(export_callback, pattern=r"^export:\d+$"))
+    app.add_handler(CommandHandler("runnow", cmd_runnow))
+    app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(build_track_conversation())
+
+    app.add_error_handler(error_handler)
 
     return app
 

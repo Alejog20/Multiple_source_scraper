@@ -63,6 +63,16 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Local-only reference docs (not committed)
+# Local-only reference docs (not committed). Note: /docs/* (not /docs/) so
+# the negations below can re-include specific files — git can't un-ignore
+# a file whose parent directory itself is excluded.
 /CLAUDE.md
-/docs/
+/docs/*
+# ...except these two, which are part of this PR and linked from the
+# README — the rest of docs/ (architecture/deployment notes) stays local.
+!/docs/amazon-access-test.md
+!/docs/aws-setup.md
+
+# scripts/probe_amazon.py output (already caught by *.json above, kept
+# explicit for clarity)
+/probe_results/

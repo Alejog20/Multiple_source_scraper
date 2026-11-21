@@ -28,6 +28,51 @@ from debug_utils import (
 
 logger = logging.getLogger(__name__)
 
+if stealth_async is not None:
+    logger.info("[Amazon] playwright-stealth is ACTIVE for the Playwright fallback.")
+else:  # pragma: no cover — playwright-stealth is a pinned dependency; see pyproject.toml
+    logger.warning(
+        "[Amazon] playwright-stealth is NOT installed — falling back to the "
+        "minimal inline stealth script. CAPTCHA/bot-detection risk is higher."
+    )
+
+
+def detect_amazon_block(html: str, status: int, final_url: str) -> Optional[str]:
+    """Pure, offline-testable check for Amazon's anti-bot responses.
+
+    Used by scripts/probe_amazon.py, which fetches HTML through its own
+    strategy implementations and has no scraper instance to call
+    ``_is_valid_page`` on. Kept separate from (rather than wired into)
+    ``_is_valid_page``/``_fetch_with_playwright``'s existing CAPTCHA checks
+    to avoid touching the funnel's current, working detection logic.
+
+    Args:
+        html: Raw response body.
+        status: HTTP status code (ignored for Playwright-sourced HTML, which
+            has no meaningful status beyond navigation success).
+        final_url: URL after following redirects.
+
+    Returns:
+        A short machine-readable reason string if the response looks like a
+        block/CAPTCHA/robot-check page, or ``None`` if it looks like a
+        normal result page.
+    """
+    if "/errors/validateCaptcha" in final_url:
+        return "captcha_redirect"
+    if status in (503, 429):
+        return f"http_{status}"
+
+    lowered = html.lower()
+    if 'action="/errors/validatecaptcha"' in lowered:
+        return "captcha_form"
+    if "robot check" in lowered:
+        return "robot_check_text"
+    if "enter the characters you see below" in lowered:
+        return "captcha_prompt_text"
+    if "api-services-support@amazon.com" in lowered:
+        return "captcha_support_email"
+    return None
+
 
 class AmazonScraper:
     def __init__(self) -> None:
@@ -37,7 +82,7 @@ class AmazonScraper:
     async def search_products(self, query: str, max_pages: int) -> List[Dict[str, Any]]:
         logger.info(f"--- Starting Amazon Search for '{query}' ---")
         async with httpx.AsyncClient(
-            http2=True, timeout=30.0, follow_redirects=True, verify=False
+            http2=True, timeout=30.0, follow_redirects=True
         ) as client:
             all_products = []
             for page_num in range(1, max_pages + 1):

@@ -24,6 +24,8 @@ dependencies = [
     "python-telegram-bot[job-queue]>=21.0",
     "truststore>=0.9.1",
     "curl-cffi>=0.7.0",
+    "tzdata>=2025.2",
+    "playwright-stealth>=1.0.6,<2",
 ]
 
 [dependency-groups]
@@ -37,6 +39,9 @@ dev = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"
+markers = [
+    "live: hits the real network (amazon.com); skipped unless RUN_LIVE=1",
+]
 
 [tool.coverage.run]
 branch = true

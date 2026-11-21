@@ -1,4 +1,4 @@
-# Multi-Platform E-Commerce Scraper — Version 4.1
+# Multi-Platform E-Commerce Scraper — Version 4.2
 
 ![Alt text](assets//1.png)
 
@@ -11,6 +11,34 @@ Individuals or teams who need price monitoring.
 A multi-platform price-tracking system built in Python. It exposes two interfaces — a rich CLI (`main.py`) for one-shot searches and history exports, and a Telegram bot (`bot.py`) for persistent, scheduled background jobs with in-chat XLSX exports — both powered by the same `core_engine.py` business logic layer.
 
 The scrapers employ a 5-layer resilience funnel per page, validate all extracted data, filter results by query relevance, and natively detect and optionally filter sponsored/advertised listings.
+
+---
+
+### What's New in Version 4.2
+
+**Security — fail-closed bot access control:**
+- The bot now rejects every Telegram user by default. `ALLOWED_USER_IDS` (comma-separated IDs) is the only way in; an empty list rejects everyone and logs the attempted `user_id` at `WARNING`, so the operator can discover their own ID on first contact. Enforced via a `TypeHandler` in `group=-1`, ahead of every command, callback, and `ConversationHandler` state.
+- Configurable input limits on `/track`: query length, max run-times per job, max active jobs per user, job duration cap, and admin-only `pages=0` (all pages).
+- Removed `verify=False` from `AmazonScraper`'s httpx client — `truststore` already resolves the system cert store, so this was disabling TLS verification for no reason.
+- `pip-audit` runs in CI (fails only on vulnerabilities with an available fix) with a weekly Dependabot config for `uv` and GitHub Actions.
+
+**Timezone-aware scheduling:**
+- `/track` run times are now interpreted in `BOT_TIMEZONE` (default `America/Bogota`) instead of hardcoded UTC. Jobs created before this change keep running in UTC — the new `timezone` column on `TrackedJob` defaults to `'UTC'` via migration, so nothing already scheduled shifts.
+
+**Observability:**
+- `/runnow <job_id>` runs one of your own jobs immediately instead of waiting for its schedule.
+- `/health` (admin-only): uptime, active job count, last successful scrape, build version (`GIT_SHA`), outbound public IP.
+- A global error handler reports exceptions to the admin in a short, traceback-free message; full tracebacks still go to the log.
+- Optional `HEARTBEAT_URL` dead-man's-switch ping every 10 minutes, and a Docker `HEALTHCHECK` based on an internal liveness file independent of user activity.
+
+**Fixed a silently disabled anti-detection feature:**
+- `playwright-stealth` was imported with a `try/except ImportError` fallback in both scrapers but was never actually declared as a dependency — it silently failed to import in every real deployment, running every Playwright fallback with only a minimal inline stealth script. Now pinned (`playwright-stealth>=1.0.6,<2`) and verified by test.
+
+**Amazon access diagnostics:**
+- `scripts/probe_amazon.py` measures per-strategy success rate against Amazon from wherever it runs (useful for checking whether a datacenter IP like EC2's gets blocked where a residential one doesn't) — see [docs/amazon-access-test.md](docs/amazon-access-test.md).
+- `/diag` (admin-only) runs a quick in-chat version of the same check.
+
+**Deploy moved from a self-managed Oracle VM to AWS EC2** — see "Deploy on AWS EC2" below.
 
 ---
 
@@ -298,12 +326,20 @@ playwright install chromium
 ```
 
 ### Step 4: Configure environment (bot mode only)
-Create a `.env` file in the project root:
+Create a `.env` file in the project root (see `.env.example` for the full
+list with comments):
 ```env
 TELEGRAM_BOT_TOKEN=your_token_here
+ALLOWED_USER_IDS=         # required — comma-separated Telegram user IDs; empty = reject everyone
+ADMIN_USER_ID=            # required for /health, /diag, error alerts, pages=0
+BOT_TIMEZONE=America/Bogota
 PAGES_PER_SCRAPE=2        # fallback default if job has no per-job setting
 DB_ECHO=false             # set to true to log all SQL
 ```
+
+The bot is fail-closed: with `ALLOWED_USER_IDS` empty, every message is
+rejected and the sender's `user_id` is logged at `WARNING` — message the
+bot once, grab your ID from the log, then fill in both variables above.
 
 ---
 
@@ -350,7 +386,12 @@ uv run python bot.py
 | `/list` | View all your active jobs |
 | `/stop` | Cancel a running job via inline keyboard |
 | `/export` | Download scrape history for a job as an Excel file |
+| `/runnow <job_id>` | Run one of your own jobs immediately |
+| `/health` | Admin only — uptime, active jobs, last scrape, version, outbound IP |
+| `/diag` | Admin only — quick per-strategy Amazon access check from this host |
 | `/help` | Show command reference |
+
+Only Telegram user IDs listed in `ALLOWED_USER_IDS` (plus `ADMIN_USER_ID`) get a response to any command at all — everyone else is silently ignored (see "What's New in Version 4.2" above).
 
 ### `/export` Flow
 
@@ -372,27 +413,51 @@ Ownership is enforced: you can only export jobs you created. Jobs with no histor
   └─ Search term:     (free text)
   └─ Frequency?       [Daily] [Every N days] [Weekly]
   └─ Interval days?   (only for "Every N days") 1–30
-  └─ Run time(s)?     HH:MM, HH:MM  (UTC)
-  └─ Pages per run?   0=all, 1–10
+  └─ Run time(s)?     HH:MM, HH:MM  (BOT_TIMEZONE, default America/Bogota)
+  └─ Pages per run?   0=all (admin only), 1–10
   └─ Include ads?     [Include ads] [Exclude ads]
-  └─ Duration (days)? 1–90
+  └─ Duration (days)? 1–MAX_JOB_DURATION_DAYS (default 90)
 ```
 
-The bot schedules scrapes at the specified UTC times and sends a MarkdownV2 price report to your chat after each run. If ads are excluded, the report appends "🚫 Sponsored products excluded."
+The bot schedules scrapes at the specified local time (per `BOT_TIMEZONE`) and sends a MarkdownV2 price report to your chat after each run. If ads are excluded, the report appends "🚫 Sponsored products excluded." Jobs created before the timezone feature existed keep running in UTC.
+
+---
+
+## Deploy on AWS EC2
+
+As of Version 4.2 the bot deploys to a `t4g.small` EC2 instance instead of
+the previous Oracle Cloud VM:
+
+- [docs/aws-setup.md](docs/aws-setup.md) — EC2 launch config, IAM roles
+  (instance role + GitHub OIDC role for deploys), on-box setup, S3
+  backups, and cost alerts. These are manual steps you run once in the
+  AWS Console/CLI — nothing here applies infrastructure automatically.
+- [docs/amazon-access-test.md](docs/amazon-access-test.md) — how to run
+  `scripts/probe_amazon.py` to check whether Amazon blocks traffic from
+  the instance's IP, and what to do if it does.
+- `.github/workflows/deploy-ec2.yml` — deploys automatically after a
+  successful `Tests` run on `master`, via GitHub OIDC + SSM Run Command
+  (no SSH, no long-lived AWS keys). Gated behind the `DEPLOY_ENABLED`
+  repository variable until the instance and IAM role exist.
 
 ---
 
 ## 9. Running the Tests
 
 ```bash
-uv run python -m unittest tests/test_scheduler.py -v
+uv run pytest --cov --cov-report=term-missing
 ```
+
+`core_engine.py`, `debug_utils.py`, `database.py`, `amazon_scraper.py`, and `mercadolibre_scraper.py` are held to 100% line+branch coverage (`pyproject.toml`'s `fail_under = 100`); `bot.py`/`main.py` are interface glue and have tests but no coverage gate.
+
+A `live` marker gates a real-network sanity check against amazon.com (`tests/live/`), skipped unless `RUN_LIVE=1` — CI always runs with `pytest -m "not live"`.
 
 The test suite validates:
 - HTML parsing logic against static fixtures
 - Data validation and edge case handling (missing prices, CAPTCHA pages)
-- Scheduler job registration and recovery
+- Scheduler job registration and recovery, including per-job timezone handling
 - `execute_scrape` integration via mocked scrapers
+- Bot access control (`ALLOWED_USER_IDS`/`ADMIN_USER_ID`), input limits, `/runnow`, `/health`, `/diag`, and the error handler
 
 ---
 
@@ -469,6 +534,16 @@ Schema migrations run automatically on startup via `database._apply_migrations` 
 ---
 
 ## 11. Changelog
+
+### Version 4.2
+- **Fail-closed bot access control:** `ALLOWED_USER_IDS`/`ADMIN_USER_ID` enforced via a `TypeHandler` in `group=-1`; an empty allowlist rejects everyone and logs their `user_id` at `WARNING`. Added configurable `/track` input limits (query length, run-times per job, active jobs per user, duration, admin-only `pages=0`).
+- **Removed `verify=False`** from `AmazonScraper`'s httpx client — `truststore` already resolves the system cert store.
+- **Timezone-aware scheduling:** `/track` run times now interpret in `BOT_TIMEZONE` (default `America/Bogota`); a new `TrackedJob.timezone` column (migrated with `DEFAULT 'UTC'`) keeps pre-existing jobs on their original UTC schedule.
+- **Observability:** `/runnow`, admin-only `/health`, a global error handler that notifies the admin, optional `HEARTBEAT_URL` ping, and a Docker `HEALTHCHECK` based on an internal liveness file.
+- **Fixed playwright-stealth silently missing from dependencies** — both scrapers imported it behind a `try/except ImportError` that always failed in production; now a real pinned dependency, verified by test.
+- **Amazon access diagnostics:** `scripts/probe_amazon.py` and admin-only `/diag` measure per-strategy success rate against Amazon from the host they run on.
+- **Hardened Docker image/compose:** non-root user (UID 10001), `--locked --no-dev` install, `shm_size`/`mem_limit`/`pids_limit`/`no-new-privileges`/`init`.
+- **CI/CD:** retired the Oracle VM SSH deploy (the actual cause of the failing `Deploy` workflow — the SSH secrets no longer exist); added OIDC + SSM-based deploy to EC2, `pip-audit`, and a weekly Dependabot config.
 
 ### Version 4.1.1
 - **Fixed a process-crashing segfault:** `AmazonScraper._is_valid_page()` no longer constructs a bare `selectolax.parser.Node()` and calls `.text()` on it — that pattern is undefined behavior against the native parser and could kill the whole process. Also added a minimal-body-content guard, matching MercadoLibre's existing check.

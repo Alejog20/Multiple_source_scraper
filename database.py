@@ -141,6 +141,11 @@ class TrackedJob(Base):
     interval_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     pages_per_run: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     include_ads: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
+    """IANA zone name (e.g. ``"America/Bogota"``) used to interpret
+    ``execution_times`` wall-clock strings. Defaults to ``"UTC"`` so jobs
+    created before this column existed keep running at the same UTC instant
+    they always have — only new jobs pick up ``BOT_TIMEZONE``."""
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
@@ -353,6 +358,14 @@ def _apply_migrations(conn) -> None:
     if "include_ads" not in existing:
         conn.execute(
             text("ALTER TABLE tracked_jobs ADD COLUMN include_ads BOOLEAN DEFAULT 1")
+        )
+    if "timezone" not in existing:
+        # DEFAULT 'UTC' (not BOT_TIMEZONE) is deliberate: existing jobs were
+        # scheduled against UTC wall-clock times and must keep firing at the
+        # same instant after this migration runs. Only newly-created jobs
+        # (via bot.py) are stamped with the configured BOT_TIMEZONE.
+        conn.execute(
+            text("ALTER TABLE tracked_jobs ADD COLUMN timezone TEXT DEFAULT 'UTC'")
         )
 
 

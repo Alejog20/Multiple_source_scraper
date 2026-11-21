@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from amazon_scraper import AmazonScraper
+from amazon_scraper import AmazonScraper, detect_amazon_block
 
 
 @pytest.fixture
@@ -384,3 +384,49 @@ class TestFetchWithHttpxSmoke:
         result = await scraper._fetch_with_httpx(fake_client, "q", 1, is_mobile=False)
         assert result == "<html>cached</html>"
         fake_client.get.assert_not_called()
+
+
+class TestDetectAmazonBlock:
+    def test_redirect_to_captcha_endpoint_detected(self):
+        reason = detect_amazon_block(
+            "<html>whatever</html>", 200, "https://www.amazon.com/errors/validateCaptcha"
+        )
+        assert reason == "captcha_redirect"
+
+    def test_503_detected_regardless_of_body(self):
+        assert detect_amazon_block("<html></html>", 503, "https://www.amazon.com/s") == "http_503"
+
+    def test_429_detected(self):
+        assert detect_amazon_block("<html></html>", 429, "https://www.amazon.com/s") == "http_429"
+
+    def test_captcha_form_in_body_detected(self):
+        html = '<form action="/errors/validateCaptcha">...</form>'
+        assert detect_amazon_block(html, 200, "https://www.amazon.com/s") == "captcha_form"
+
+    def test_robot_check_text_detected(self):
+        html = "<html><title>Robot Check</title></html>"
+        assert detect_amazon_block(html, 200, "https://www.amazon.com/s") == "robot_check_text"
+
+    def test_captcha_prompt_text_detected(self):
+        html = "<p>Enter the characters you see below</p>"
+        assert detect_amazon_block(html, 200, "https://www.amazon.com/s") == "captcha_prompt_text"
+
+    def test_support_email_text_detected(self):
+        html = "<p>contact us at api-services-support@amazon.com</p>"
+        assert detect_amazon_block(html, 200, "https://www.amazon.com/s") == "captcha_support_email"
+
+    def test_normal_page_returns_none(self):
+        html = "<html><body><div data-asin='B01'>Normal product page</div></body></html>"
+        assert detect_amazon_block(html, 200, "https://www.amazon.com/s?k=test") is None
+
+
+class TestPlaywrightStealthDependency:
+    """playwright-stealth is a real pyproject.toml dependency (not just an
+    optional try/except shim) — if it's ever accidentally removed from
+    dependencies again, this import-time check fails loudly instead of
+    silently disabling stealth in production."""
+
+    def test_stealth_async_is_available(self):
+        from amazon_scraper import stealth_async
+
+        assert stealth_async is not None
