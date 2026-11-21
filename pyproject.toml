@@ -39,6 +39,9 @@ dev = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"
+markers = [
+    "live: hits the real network (amazon.com); skipped unless RUN_LIVE=1",
+]
 
 [tool.coverage.run]
 branch = true

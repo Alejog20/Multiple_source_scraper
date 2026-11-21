@@ -275,6 +275,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/export – Download history for a job as an Excel file\n"
         "/runnow – Run one of your jobs immediately\n"
         "/health – Admin: operational status snapshot\n"
+        "/diag   – Admin: probe Amazon access from this host\n"
         "/help   – Show this message"
     )
 
@@ -1142,6 +1143,50 @@ async def _touch_health_file(context: ContextTypes.DEFAULT_TYPE) -> None:
         _logger.warning("Could not touch HEALTH_FILE %s: %s", HEALTH_FILE, exc)
 
 
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: runs a minimal (1 query, 1 round) version of
+    scripts/probe_amazon.py in the background and reports a per-strategy
+    ✅/⚠️/❌ summary. Shares core_engine's _browser_semaphore so this never
+    races a scheduled job's own Playwright instance."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _is_admin(user_id):
+        await update.message.reply_text("Admin only.")
+        return
+
+    await update.message.reply_text("Running diagnostics — this can take a minute…")
+    chat_id = update.effective_chat.id
+    asyncio.create_task(_run_diag_and_report(context, chat_id))
+
+
+async def _run_diag_and_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    from amazon_scraper import AmazonScraper
+    from core_engine import _browser_semaphore
+    from scripts.probe_amazon import ALL_STRATEGIES, get_public_ip, run_attempt
+
+    try:
+        public_ip = await get_public_ip()
+        parser_helper = AmazonScraper()
+        lines = [f"Outbound IP: {public_ip}"]
+
+        async with _browser_semaphore:
+            for strategy in ALL_STRATEGIES:
+                attempt = await run_attempt(strategy, "kindle paperwhite", page=1, parser=parser_helper)
+                if attempt.error:
+                    lines.append(f"❌ {strategy}: {attempt.error}")
+                elif attempt.block_reason:
+                    lines.append(f"⚠️ {strategy}: {attempt.block_reason}")
+                else:
+                    lines.append(f"✅ {strategy}: {attempt.products_found} product(s)")
+
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    except Exception as exc:
+        _logger.error("cmd_diag: probe run failed: %s", exc)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"Diagnostics failed: {exc}")
+        except Exception as send_exc:
+            _logger.warning("cmd_diag: could not report failure to chat: %s", send_exc)
+
+
 # ---------------------------------------------------------------------------
 # Startup hooks
 # ---------------------------------------------------------------------------
@@ -1206,6 +1251,7 @@ async def post_init(application: Application) -> None:
             BotCommand("export", "Download scrape history as Excel"),
             BotCommand("runnow", "Run one of your jobs immediately"),
             BotCommand("health", "Admin: operational status snapshot"),
+            BotCommand("diag", "Admin: probe Amazon access from this host"),
             BotCommand("help", "Access documentation and syntax guide"),
         ]
     )
@@ -1237,6 +1283,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(export_callback, pattern=r"^export:\d+$"))
     app.add_handler(CommandHandler("runnow", cmd_runnow))
     app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(build_track_conversation())
 
     app.add_error_handler(error_handler)
